@@ -1,3 +1,5 @@
+-- serverscript in serverscriptservice
+
 local DataStoreService = game:GetService("DataStoreService")
 local VoxelWorldDataStore = DataStoreService:GetDataStore("PlayerVoxelWorlds_v1")
 local DestroyedBlocksStore = DataStoreService:GetDataStore("PlayerDestroyedBlocks_v1") -- 🆕 Remembers broken world blocks
