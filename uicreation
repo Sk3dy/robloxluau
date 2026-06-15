@@ -1,3 +1,5 @@
+--localscript in starterplayerscripts
+
 local player = game.Players.LocalPlayer
 local playergui = player:WaitForChild("PlayerGui")
 local screengui = playergui:WaitForChild("ScreenGui")
