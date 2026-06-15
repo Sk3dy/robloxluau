@@ -1,3 +1,5 @@
+-- serverscript in serverscriptservice
+
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local MineResourceEvent = ReplicatedStorage:WaitForChild("MineResourceEvent")
 local SaveInventoryEvent = ReplicatedStorage:WaitForChild("SaveInventory")
