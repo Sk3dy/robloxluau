@@ -1,0 +1,24 @@
+-- OceanGenerator (Script in ServerScriptService)
+-- True Roblox terrain water, entire ocean in one call
+
+local WATER_TOP_Y    = -18
+local WATER_BOTTOM_Y = -100
+local WATER_HEIGHT   = WATER_TOP_Y - WATER_BOTTOM_Y  -- 30 studs tall
+local WORLD_SIZE     = 5000
+
+local centerY = WATER_BOTTOM_Y + (WATER_HEIGHT / 2)
+
+workspace.Terrain:FillBlock(
+	CFrame.new(0, centerY, 0),
+	Vector3.new(WORLD_SIZE, WATER_HEIGHT, WORLD_SIZE),
+	Enum.Material.Water
+)
+
+-- Water appearance settings
+workspace.Terrain.WaterColor        = Color3.fromRGB(125, 137, 148)  -- the global water color
+workspace.Terrain.WaterReflectance  = 1  -- 0 = no shine, 1 = mirror
+workspace.Terrain.WaterTransparency = 1   -- 0 = fully opaque, 1 = invisible
+workspace.Terrain.WaterWaveSize     = 0   -- 0 = flat, 1 = big waves
+workspace.Terrain.WaterWaveSpeed    = 10    -- how fast the waves move
+
+print("✅ OceanGenerator: Real terrain water filled!")
