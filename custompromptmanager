@@ -1,0 +1,61 @@
+local ProximityPromptService = game:GetService("ProximityPromptService")
+local TweenService = game:GetService("TweenService")
+local Players = game:GetService("Players")
+local player = Players.LocalPlayer
+
+-- Create a clean, screen-space UI container for custom prompts
+local screenGui = Instance.new("ScreenGui")
+screenGui.Name = "CustomPromptGui"
+screenGui.ResetOnSpawn = false
+screenGui.Parent = player:WaitForChild("PlayerGui")
+
+-- This runs automatically every time a "Custom" prompt appears on your screen
+ProximityPromptService.PromptShown:Connect(function(prompt, inputType)
+	if prompt.Style ~= Enum.ProximityPromptStyle.Custom then return end
+
+	-- 1. Create a BillboardGui that hovers directly over the resource node
+	local billboard = Instance.new("BillboardGui")
+	billboard.Size = UDim2.new(0, 60, 0, 60)
+	billboard.AlwaysOnTop = true
+	billboard.Adornee = prompt.Parent
+	billboard.Parent = screenGui
+
+	-- 2. Create a clean, circular loading bar frame
+	local progressFrame = Instance.new("Frame")
+	progressFrame.Size = UDim2.new(0, 0, 1, 0) -- Starts completely empty
+	progressFrame.BackgroundColor3 = Color3.fromRGB(0, 255, 127) -- Mint green progress color
+	progressFrame.BorderSizePixel = 0
+	progressFrame.Parent = billboard
+
+	-- Add rounded corners to make it look smooth
+	local uiCorner = Instance.new("UICorner")
+	uiCorner.CornerRadius = UDim.new(0, 8)
+	uiCorner.Parent = progressFrame
+
+	-- Track when the player presses and holds the key
+	local holdConn
+	local hideConn
+
+	holdConn = prompt.PromptButtonHoldBegan:Connect(function()
+		-- Animate the frame expanding to full size perfectly matching your tool's mining speed!
+		local tween = TweenService:Create(progressFrame, TweenInfo.new(prompt.HoldDuration, Enum.EasingStyle.Linear), {
+			Size = UDim2.new(1, 0, 1, 0)
+		})
+		tween:Play()
+
+		-- If they let go early, cancel the bar animation instantly
+		local stopConn
+		stopConn = prompt.PromptButtonHoldEnded:Connect(function()
+			tween:Cancel()
+			progressFrame.Size = UDim2.new(0, 0, 1, 0)
+			stopConn:Disconnect()
+		end)
+	end)
+
+	-- Clean up the assets from memory when the player walks away from the tree/rock
+	hideConn = prompt.PromptHidden:Connect(function()
+		billboard:Destroy()
+		if holdConn then holdConn:Disconnect() end
+		hideConn:Disconnect()
+	end)
+end)
