@@ -1,3 +1,5 @@
+-- modulescript in replicatedstorage
+
 local InventorySessionManager = {}
 InventorySessionManager.Sessions = {} -- Hidden master table both scripts will share
 
