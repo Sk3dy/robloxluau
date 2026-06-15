@@ -1,3 +1,5 @@
+-- serverscript in serverscriptservice
+
 local DataStoreService = game:GetService("DataStoreService")
 local InventoryStore = DataStoreService:GetDataStore("PlayerInventory_v4") 
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
