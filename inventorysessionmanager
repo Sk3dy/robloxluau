@@ -1,0 +1,4 @@
+local InventorySessionManager = {}
+InventorySessionManager.Sessions = {} -- Hidden master table both scripts will share
+
+return InventorySessionManager
