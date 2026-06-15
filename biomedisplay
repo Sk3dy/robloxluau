@@ -1,0 +1,62 @@
+-- BiomeDisplay (LocalScript in StarterPlayerScripts)
+-- Polls your position every second and updates a label on screen
+
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+
+local player = Players.LocalPlayer
+local GetBiomeEvent = ReplicatedStorage:WaitForChild("GetBiomeAtPosition")
+
+-- Build the label UI
+local screenGui = Instance.new("ScreenGui")
+screenGui.Name = "BiomeDisplayGui"
+screenGui.ResetOnSpawn = false
+screenGui.Parent = player:WaitForChild("PlayerGui")
+
+local label = Instance.new("TextLabel")
+label.Name = "BiomeLabel"
+label.Size = UDim2.new(0, 220, 0, 40)
+label.Position = UDim2.new(0.5, -110, 0, 12) -- top center of screen
+label.AnchorPoint = Vector2.new(0, 0)
+label.BackgroundColor3 = Color3.fromRGB(0, 0, 0)
+label.BackgroundTransparency = 0.45
+label.TextColor3 = Color3.fromRGB(255, 255, 255)
+label.TextSize = 15
+label.Font = Enum.Font.GothamMedium
+label.Text = "🌊 Detecting biome..."
+label.Parent = screenGui
+
+local uiCorner = Instance.new("UICorner")
+uiCorner.CornerRadius = UDim.new(0, 10)
+uiCorner.Parent = label
+
+-- Colour the label background based on which ocean you're in
+local BIOME_COLORS = {
+	["Cold Ocean"]  = Color3.fromRGB(26, 90, 138),
+	["Coral Ocean"] = Color3.fromRGB(0, 155, 138),
+	["Warm Ocean"]  = Color3.fromRGB(45, 130, 195),
+}
+
+-- Poll position every 1 second
+task.spawn(function()
+	while true do
+		local character = player.Character
+		if character and character.PrimaryPart then
+			local pos = character.PrimaryPart.Position
+			local worldX = pos.X
+			local worldZ = pos.Z
+
+			-- Only query if inside the 1000x1000 biome zone
+			if math.abs(worldX) <= 500 and math.abs(worldZ) <= 500 then
+				local biomeName = GetBiomeEvent:InvokeServer(worldX, worldZ)
+				label.Text = "🌊 " .. biomeName
+				label.BackgroundColor3 = BIOME_COLORS[biomeName] or Color3.fromRGB(30, 80, 120)
+			else
+				label.Text = "🌊 Open Ocean"
+				label.BackgroundColor3 = Color3.fromRGB(30, 80, 120)
+			end
+		end
+
+		task.wait(1)
+	end
+end)
