@@ -1,0 +1,1471 @@
+local Players = game:GetService("Players")
+local TextChatService = game:GetService("TextChatService")
+local UserInputService = game:GetService("UserInputService")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local StarterGui = game:GetService("StarterGui")
+local RunService = game:GetService("RunService")
+
+
+-- Completely disable Roblox's built-in inventory UI bar and key interceptors
+StarterGui:SetCoreGuiEnabled(Enum.CoreGuiType.Backpack, false)
+local GLOBAL_MINING_SPEED_MULTIPLIER = 1.0 
+-- 📌 GLOBAL VARIATIONS (Place at the very top of the script)
+local canPlaceHere = false
+
+
+local player = Players.LocalPlayer
+local camera = workspace.CurrentCamera
+local playergui = player:WaitForChild("PlayerGui")
+local screengui = playergui:WaitForChild("ScreenGui", true)
+local inventoryui = screengui:FindFirstChild("inventoryui", true)
+
+local cellConstraint2 = inventoryui:FindFirstChild("CellConstraint2", true)
+local backpackui = screengui:FindFirstChild("backpackui", true)
+local cellConstraint = backpackui and backpackui:FindFirstChild("CellConstraint", true)
+
+-- Universal slot finder: searches hotbar (1-9) then backpack (10-72) seamlessly
+local function getSlot(number)
+	if number <= 9 then
+		return cellConstraint2 and cellConstraint2:FindFirstChild("hotbar" .. number)
+	else
+		return cellConstraint and cellConstraint:FindFirstChild("hotbar" .. number)
+	end
+end
+local SaveInventoryEvent = ReplicatedStorage:WaitForChild("SaveInventory")
+local MineResourceEvent = ReplicatedStorage:WaitForChild("MineResourceEvent")
+local PlaceBlockEvent = ReplicatedStorage:WaitForChild("PlaceBlockEvent") -- 🏗️ For Grid Placement
+local WorldLoadCompleteEvent = ReplicatedStorage:WaitForChild("WorldLoadCompleteEvent")
+local UsePotionEvent = ReplicatedStorage:FindFirstChild("UsePotionEvent") or ReplicatedStorage:WaitForChild("MineResourceEvent") -- Fallback if unified
+local ItemTemplates = ReplicatedStorage:WaitForChild("ItemTemplates")     -- 📦 Master blueprints
+local ToolsStorage = ReplicatedStorage:WaitForChild("ToolsStorage")
+
+local localHasteMultiplier = 1.0 -- Default normal speed multiplier
+
+local SelectionBox = Instance.new("SelectionBox")
+SelectionBox.Color3 = Color3.fromRGB(255, 255, 255) -- Yellow outline
+SelectionBox.LineThickness = 0.01
+SelectionBox.Parent = player:WaitForChild("PlayerGui") -- Safe from character death!
+
+local GRID_SIZE = 4
+local OccupiedGrids = {}
+-- 🆕 Converts any world coordinate into its grid cell index (an integer)
+local function worldToCellIndex(value)
+	return math.floor(value / GRID_SIZE)
+end
+
+-- Add these near the top with your other variables, after line 50
+local placementRaycastParams = RaycastParams.new()
+placementRaycastParams.FilterType = Enum.RaycastFilterType.Exclude
+
+local cachedPreviewDescendants = nil -- cache for preview model parts
+local cachedActiveMapChildren = nil  -- cache for ActiveMap children list
+local lastSnappedPosition = nil      -- track if preview actually moved
+local previewHasBoundaries = false
+-- Add near top with other variables
+local boundaryBlockCache = {} -- remembers which ActiveMap instances have boundaries
+
+
+
+-- Snaps a single point to the grid
+local function snapToGrid(position: Vector3)
+	return Vector3.new(
+		math.round(position.X / GRID_SIZE) * GRID_SIZE,
+		math.round(position.Y / GRID_SIZE) * GRID_SIZE,
+		math.round(position.Z / GRID_SIZE) * GRID_SIZE
+	)
+end
+
+-- Calculates every single 4x4 coordinate a model occupies based on its size
+local function getOccupiedCells(centerPos: Vector3, modelSize: Vector3)
+	local cells = {}
+	local stepsX = math.max(1, math.round(modelSize.X / GRID_SIZE))
+	local stepsY = math.max(1, math.round(modelSize.Y / GRID_SIZE))
+	local stepsZ = math.max(1, math.round(modelSize.Z / GRID_SIZE))
+
+	local startX = centerPos.X - ((stepsX - 1) * (GRID_SIZE / 2))
+	local startY = centerPos.Y - ((stepsY - 1) * (GRID_SIZE / 2))
+	local startZ = centerPos.Z - ((stepsZ - 1) * (GRID_SIZE / 2))
+
+	for x = 0, stepsX - 1 do
+		for y = 0, stepsY - 1 do
+			for z = 0, stepsZ - 1 do
+				local cellPos = Vector3.new(startX + (x * GRID_SIZE), startY + (y * GRID_SIZE), startZ + (z * GRID_SIZE))
+				local key = string.format("%d,%d,%d", cellPos.X, cellPos.Y, cellPos.Z)
+				table.insert(cells, key)
+			end
+		end
+	end
+	return cells
+end
+
+local function getModelOccupiedCells(model, centerPos, size)
+	local boundaries = {}
+	for _, part in ipairs(model:GetDescendants()) do
+		if part:IsA("BasePart") and part.Name:match("^TransparentBoundary") then
+			table.insert(boundaries, part)
+		end
+	end
+
+	if #boundaries > 0 then
+		local cells = {}
+		for _, part in ipairs(boundaries) do
+			local pos = part.Position
+			-- 🔧 Snap to world-coordinate grid lines (NOT divided indices)
+			-- so this matches the key format used by getServerOccupiedCells
+			local snappedX = math.round(pos.X / GRID_SIZE) * GRID_SIZE
+			local snappedY = math.round(pos.Y / GRID_SIZE) * GRID_SIZE
+			local snappedZ = math.round(pos.Z / GRID_SIZE) * GRID_SIZE
+
+			table.insert(cells, string.format("%d,%d,%d", snappedX, snappedY, snappedZ))
+		end
+		return cells
+	end
+
+	-- Fallback: no TransparentBoundary parts found, use existing bounding-box method
+	return getOccupiedCells(centerPos, size)
+end
+
+-- ========================================================
+-- 🌍 WORLD LOAD GRID REBUILDER
+-- ========================================================
+-- ========================================================
+-- 🌍 WORLD LOAD GRID REBUILDER
+-- ========================================================
+local function rebuildOccupiedGrids()
+	print("🔄 Scanning ActiveMap to rebuild Occupied Grids...")
+	OccupiedGrids = {} -- Clear the old list first
+
+	local activeMap = workspace:FindFirstChild("ActiveMap")
+	if not activeMap then 
+		warn("⚠️ ActiveMap folder not found! Cannot rebuild grids.")
+		return 
+	end
+
+	for _, instance in ipairs(activeMap:GetChildren()) do
+		local boundingCFrame, boundingSize
+		if instance:IsA("Model") then
+			boundingCFrame, boundingSize = instance:GetBoundingBox()
+		elseif instance:IsA("BasePart") then
+			boundingCFrame = CFrame.new(instance.Position)
+			boundingSize = instance.Size
+		else
+			continue -- Skip anything that isn't a Model or Part
+		end
+
+		local blockCenter = Vector3.new(
+			math.round(boundingCFrame.Position.X / GRID_SIZE) * GRID_SIZE,
+			math.round(boundingCFrame.Position.Y / GRID_SIZE) * GRID_SIZE,
+			math.round(boundingCFrame.Position.Z / GRID_SIZE) * GRID_SIZE
+		)
+
+		local cells = getOccupiedCells(blockCenter, boundingSize)
+		for _, key in ipairs(cells) do
+			OccupiedGrids[key] = instance
+		end
+	end
+	print("✅ Occupied Grids successfully rebuilt! (" .. #activeMap:GetChildren() .. " items scanned)")
+end
+
+-- 🔔 THE FINISH LINE: Wait for the server to say "I am 100% done loading!"
+WorldLoadCompleteEvent.OnClientEvent:Connect(function()
+	print("🌍 Server confirmed: World loading is 100% complete! Triggering grid rebuild...")
+	rebuildOccupiedGrids()
+end)
+
+
+
+
+-- ========================================================
+-- 🎨 PROGRESS BAR UI SETUP (Pure Relative Scale Lock)
+-- ========================================================
+
+-- Force screen interior to ignore device notches/safe zones for identical scale math
+screengui.ScreenInsets = Enum.ScreenInsets.None 
+
+local ProgressBarBackground = Instance.new("Frame")
+ProgressBarBackground.Name = "MiningProgressBar"
+-- 📐 EXPANDED WIDTH: Increased from 0.12 to 0.22 (22% of screen width). Height remains 6 pixels.
+ProgressBarBackground.Size = UDim2.new(0.22, 0, 0, 6) 
+
+-- ⚙️ PURE SCALE LOCK MATRIX:
+-- Center the anchor point perfectly on both axes (0.5, 0.5)
+ProgressBarBackground.AnchorPoint = Vector2.new(0.5, 0.5) 
+
+-- Center horizontally (0.5) and lock it to exactly 82% down the screen (0.82).
+-- With 0 pixels of offset everywhere, this relative gap will never break or drift!
+ProgressBarBackground.Position = UDim2.new(0.5, 0, 0.82, 0) 
+
+ProgressBarBackground.BackgroundColor3 = Color3.fromRGB(30, 30, 30)
+ProgressBarBackground.BorderSizePixel = 1
+ProgressBarBackground.BorderColor3 = Color3.fromRGB(0, 0, 0)
+ProgressBarBackground.Visible = false
+ProgressBarBackground.Parent = screengui
+
+-- 🛑 SAFETY NET: Caps the max size so it doesn't over-expand on big monitors
+local SizeConstraint = Instance.new("UISizeConstraint")
+SizeConstraint.MinSize = Vector2.new(0, 0)       -- Free scaling down on mobile
+-- ⚙️ Max width increased to 300 to accommodate the new wider design on PC screens
+SizeConstraint.MaxSize = Vector2.new(300, 1000)  
+SizeConstraint.Parent = ProgressBarBackground
+
+local ProgressBarFill = Instance.new("Frame")
+ProgressBarFill.Name = "Fill"
+ProgressBarFill.Size = UDim2.new(0, 0, 1, 0) 
+ProgressBarFill.BackgroundColor3 = Color3.fromRGB(255, 255, 255) -- White Fill
+ProgressBarFill.BorderSizePixel = 0
+ProgressBarFill.Parent = ProgressBarBackground
+
+local ProgressText = Instance.new("TextLabel")
+ProgressText.Name = "Percentage"
+ProgressText.Size = UDim2.new(1, 0, 1, 0)
+ProgressText.Position = UDim2.new(0, 0, 0, -12) 
+ProgressText.BackgroundTransparency = 1
+ProgressText.Text = "0%"
+ProgressText.TextColor3 = Color3.fromRGB(255, 255, 255)
+ProgressText.TextSize = 11                       
+ProgressText.Font = Enum.Font.SourceSansBold
+ProgressText.ZIndex = 2
+ProgressText.Parent = ProgressBarBackground
+
+
+-- Listen for server speed adjustments
+SaveInventoryEvent.OnClientEvent:Connect(function(action, value)
+	if action == "UpdateHaste" and value then
+		localHasteMultiplier = value
+		print("🧪 CLIENT: Received haste update from server! Local multiplier is now: " .. tostring(localHasteMultiplier))
+	end
+end)
+
+-- 1. PERMISSIONS FOR COMMANDS
+local admins = { 
+	[444027387] = true, -- Your ID
+	[175054982] = true, -- Co-owner / Friend 1
+}
+
+-- 🦅 FLY COMMAND SWITCH
+local isFlying = false
+
+-- 🛡️ FORWARD DECLARATIONS: Introduce these to Roblox early so it doesn't panic!
+local currentlySelectedSlot = nil
+local activeEquippedItemName = ""
+local activePlacementBlockName = ""
+local stopPlacementMode -- We will give this its actual job further down
+
+-- 2. DICTIONARY OF ITEMS
+local itemDatabase = {
+	[1] = { name = "Dirt", color = Color3.fromRGB(139, 69, 19) } ,
+	[2] = { name = "Stone", color = Color3.fromRGB(122, 127, 139) } ,
+	[3] = { name = "Grass Block", color = Color3.fromRGB(100, 149, 107) } ,
+	[4] = { name = "Pickaxe", color = Color3.fromRGB(192, 192, 192) } ,
+	[5] = { name = "Haste Potion", color = Color3.fromRGB(161, 32, 247) } ,
+	[6] = { name = "Super Haste Potion", color = Color3.fromRGB(255, 85, 85) } ,
+	[7] = { name = "Heart Of The World", color = Color3.fromRGB(34, 34, 34) } ,
+	[8] = { name = "4x4 dirt", color = Color3.fromRGB(44, 38, 35) } ,
+	[9] = { name = "Diamond Block", color = Color3.fromRGB(107, 124, 139) } ,
+	[10] = { name = "6x6 plate", color = Color3.fromRGB(34, 34, 34) } ,
+	[11] = { name = "Silica Sand", color = Color3.fromRGB(228, 230, 206) } ,
+	[12] = { name = "Raw Copper", color = Color3.fromRGB(163, 100, 36) } ,
+	[13] = { name = "Oak Wood", color = Color3.fromRGB(77, 64, 53) } ,
+	[14] = { name = "Oak Sapling", color = Color3.fromRGB(103, 163, 47) } ,
+	[15] = { name = "Oak Tree", color = Color3.fromRGB(44, 77, 34) } ,
+	[16] = { name = "Basic Miner", color = Color3.fromRGB(91, 93, 105) } ,
+}
+
+local draggingItem = nil
+local dragInput = nil
+local mousePos = nil
+local startPos = nil
+local originalParent = nil
+
+-- Helper function to construct a new item UI object
+local function createItemVisual(itemName, itemColor, parentSlot, amount)
+	amount = amount or 1
+
+	local newItem = Instance.new("Frame")
+	newItem.Name = itemName
+	newItem.Size = UDim2.new(1, 0, 1, 0)
+	newItem.BackgroundColor3 = itemColor
+	newItem.ZIndex = 2
+	newItem.Active = true
+	newItem.Parent = parentSlot
+
+	local textLabel = Instance.new("TextLabel")
+	textLabel.Size = UDim2.new(1, 0, 1, 0)
+	textLabel.BackgroundTransparency = 1
+	textLabel.Text = itemName
+	textLabel.TextColor3 = Color3.fromRGB(255, 255, 255)
+	textLabel.TextSize = 14
+	textLabel.ZIndex = 3
+	textLabel.Active = false
+	textLabel.Parent = newItem
+
+	local countLabel = Instance.new("TextLabel")
+	countLabel.Name = "CountLabel"
+	countLabel.Size = UDim2.new(0.4, 0, 0.4, 0)
+	countLabel.Position = UDim2.new(0.6, 0, 0.6, 0)
+	countLabel.BackgroundTransparency = 1
+	countLabel.TextXAlignment = Enum.TextXAlignment.Right
+	countLabel.TextYAlignment = Enum.TextYAlignment.Bottom
+	countLabel.Text = tostring(amount)
+	countLabel.TextColor3 = Color3.fromRGB(255, 255, 0)
+	countLabel.TextSize = 16
+	countLabel.Font = Enum.Font.SourceSansBold
+	countLabel.ZIndex = 4
+	countLabel.Visible = (amount > 1)
+	countLabel.Parent = newItem
+
+	newItem:SetAttribute("Amount", amount)
+
+	return newItem
+end
+
+-- 3. INTERACTIVE REGISTER FOR DRAGS
+local function makeElementDraggable(itemFrame)
+	itemFrame.InputBegan:Connect(function(input)
+		if (input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch) and not draggingItem then
+			draggingItem = itemFrame
+			mousePos = input.Position
+			startPos = itemFrame.Position
+			originalParent = itemFrame.Parent
+
+			itemFrame.ZIndex = 100 
+			if itemFrame:FindFirstChildOfClass("TextLabel") then
+				itemFrame:FindFirstChildOfClass("TextLabel").ZIndex = 101
+			end
+
+			print("--- DRAG STARTED: " .. itemFrame.Name .. " ---")
+		end
+	end)
+
+	itemFrame.InputChanged:Connect(function(input)
+		if (input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch) and draggingItem == itemFrame then
+			dragInput = input
+		end
+	end)
+end
+
+UserInputService.InputChanged:Connect(function(input)
+	if input == dragInput and draggingItem then
+		local delta = input.Position - mousePos
+		draggingItem.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+	end
+end)
+
+UserInputService.InputEnded:Connect(function(input)
+	if (input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch) and draggingItem then
+		local itemFrame = draggingItem
+		draggingItem = nil
+		dragInput = nil
+
+		itemFrame.ZIndex = 2
+		if itemFrame:FindFirstChildOfClass("TextLabel") then
+			itemFrame:FindFirstChildOfClass("TextLabel").ZIndex = 3
+		end
+
+		print("--- DRAG ENDED / PROCESSING DROP ---")
+
+		local itemAbsPos = itemFrame.AbsolutePosition
+		local itemAbsSize = itemFrame.AbsoluteSize
+		local itemCenterX = itemAbsPos.X + (itemAbsSize.X / 2)
+		local itemCenterY = itemAbsPos.Y + (itemAbsSize.Y / 2)
+
+		local droppedInSlot = false
+		local allUIObjects = screengui:GetDescendants()
+
+		for _, obj in ipairs(allUIObjects) do
+			if obj:IsA("Frame") then
+				local name = obj.Name:lower()
+
+				if name:match("^hotbar%d+") or name:match("^inventory%d+") or name:match("^chest%d+") then
+					local absPos = obj.AbsolutePosition
+					local absSize = obj.AbsoluteSize
+
+					local minX, maxX = absPos.X - 15, absPos.X + absSize.X + 15
+					local minY, maxY = absPos.Y - 15, absPos.Y + absSize.Y + 15
+
+					if itemCenterX >= minX and itemCenterX <= maxX and itemCenterY >= minY and itemCenterY <= maxY then
+						print("🎯 Dropped over slot:", obj.Name)
+						droppedInSlot = true
+
+						local existingItem = nil
+						for _, child in ipairs(obj:GetChildren()) do
+							if child:IsA("Frame") and child ~= itemFrame then
+								existingItem = child
+								break
+							end
+						end
+
+						if existingItem then
+							if existingItem.Name == itemFrame.Name then
+								local currentAmount = existingItem:GetAttribute("Amount") or 1
+								local draggedAmount = itemFrame:GetAttribute("Amount") or 1
+								local newAmount = currentAmount + draggedAmount
+
+								existingItem:SetAttribute("Amount", newAmount)
+								local countLabel = existingItem:FindFirstChild("CountLabel")
+								if countLabel then
+									countLabel.Text = tostring(newAmount)
+									countLabel.Visible = true
+								end
+
+								SaveInventoryEvent:FireServer("UpdateSlot", originalParent.Name, nil, nil)
+								SaveInventoryEvent:FireServer("UpdateSlot", obj.Name, existingItem.Name, newAmount)
+
+								itemFrame:Destroy()
+								break
+							else
+								existingItem.Parent = originalParent
+								existingItem.Position = UDim2.new(0, 0, 0, 0)
+
+								itemFrame.Parent = obj
+								itemFrame.Position = UDim2.new(0, 0, 0, 0)
+
+								SaveInventoryEvent:FireServer("UpdateSlot", originalParent.Name, existingItem.Name, existingItem:GetAttribute("Amount"))
+								SaveInventoryEvent:FireServer("UpdateSlot", obj.Name, itemFrame.Name, itemFrame:GetAttribute("Amount"))
+								break
+							end
+						else
+							if originalParent and originalParent ~= obj then
+								SaveInventoryEvent:FireServer("UpdateSlot", originalParent.Name, nil, nil)
+							end
+
+							itemFrame.Parent = obj 
+							itemFrame.Position = UDim2.new(0, 0, 0, 0) 
+
+							SaveInventoryEvent:FireServer("UpdateSlot", obj.Name, itemFrame.Name, itemFrame:GetAttribute("Amount"))
+							break
+						end
+					end
+				end
+			end
+		end
+
+		if not droppedInSlot then
+			print("❌ Drop missed target boundaries. Returning to original position.")
+			itemFrame.Parent = originalParent
+			itemFrame.Position = UDim2.new(0, 0, 0, 0)
+		end
+	end
+end)
+
+-- 4. DATA RESTORER (FINAL PERFECT VERSION)
+SaveInventoryEvent.OnClientEvent:Connect(function(action, savedData)
+	print("🔍 DEBUG: SaveInventoryEvent fired with action:", action)
+
+	if action == "Load" and savedData then
+		print("📦 Received Save Data from Server. Contents:", savedData)
+
+		-- [ORIGINAL RESTORATION LOOP]
+		for slotName, itemInfo in pairs(savedData) do
+			local targetSlot = screengui:FindFirstChild(slotName, true)
+			if targetSlot and targetSlot:IsA("Frame") then
+				if itemInfo == "Clear" then
+					print("🧹 ↳ Clear Request: Wiping visual item frames from slot: " .. slotName)
+					for _, child in ipairs(targetSlot:GetChildren()) do
+						if child:IsA("Frame") or child:IsA("TextLabel") or child:IsA("ImageLabel") then
+							child:Destroy()
+						end
+					end
+				elseif type(itemInfo) == "table" and itemInfo.name then
+					local itemName = itemInfo.name
+					local itemAmount = itemInfo.amount or 1
+					print("  ↳ ✅ Restoring: " .. itemName .. " x" .. tostring(itemAmount) .. " into slot: " .. slotName)
+					for _, child in ipairs(targetSlot:GetChildren()) do
+						if child:IsA("Frame") or child:IsA("TextLabel") then
+							child:Destroy()
+						end
+					end
+					local matchedData = nil
+					for _, data in pairs(itemDatabase) do
+						if data.name == itemName then matchedData = data break end
+					end
+					if matchedData then
+						local loadedItem = createItemVisual(matchedData.name, matchedData.color, targetSlot, itemAmount)
+						makeElementDraggable(loadedItem)
+					end
+				end
+			end
+		end
+
+		-- 🛡️ SAFETY CHECK: Did we just run out of the item we are currently using?
+		local itemWeAreUsing = ""
+		if activePlacementBlockName ~= "" then
+			itemWeAreUsing = activePlacementBlockName
+		elseif activeEquippedItemName ~= "" then
+			itemWeAreUsing = activeEquippedItemName
+		end
+
+		print("🔍 DEBUG: Client thinks it is currently trying to place/use:", itemWeAreUsing)
+
+		if itemWeAreUsing ~= "" then
+			-- 🛡️ SMART FILTER: If it's a tool or potion, SKIP the "ran out" check entirely!
+			local isTool = ToolsStorage:FindFirstChild(itemWeAreUsing) ~= nil
+
+			if isTool then
+				print("✅ DEBUG: Item is a tool/potion. Skipping 'ran out' check to prevent accidental unequip.")
+			else
+				local stillHaveItem = false
+
+				-- Look through all our inventory slots to see if we still have this block
+				for slotName, itemInfo in pairs(savedData) do
+					if type(itemInfo) == "table" and itemInfo.name == itemWeAreUsing and (itemInfo.amount or 0) > 0 then
+						stillHaveItem = true
+						print("🔍 DEBUG: Found " .. itemWeAreUsing .. " in slot " .. slotName .. " with amount: " .. itemInfo.amount)
+						break
+					elseif itemInfo == "Clear" then
+						print("🔍 DEBUG: Slot " .. slotName .. " was cleared by server.")
+					end
+				end
+
+				-- If we DON'T have it anymore, force stop everything!
+				if not stillHaveItem then
+					print("⚠️ RAN OUT OF BLOCK! Auto-unequipping and stopping placement for: " .. itemWeAreUsing)
+					currentlySelectedSlot = nil
+					activeEquippedItemName = ""
+					stopPlacementMode() -- This deletes the ghost block
+					MineResourceEvent:FireServer("EQUIP_TOOL_ACTION", "Clear") -- This tells server we have nothing equipped
+				else
+					print("✅ DEBUG: We still have the item, or it wasn't the one we were placing.")
+				end
+			end
+		end
+	end
+end)
+
+TextChatService.OnIncomingMessage = function(message)
+	if message.TextSource and message.TextSource.UserId == player.UserId and message.Status == Enum.TextChatMessageStatus.Success then
+		local chatText = message.Text
+
+		-- 🆕 Admin-only commands check (moved here so it doesn't block the whole script)
+		if not admins[player.UserId] then return end
+
+		if string.sub(chatText, 1, 8) == "/additem" then
+			local argumentsText = string.sub(chatText, 9) 
+			local args = string.split(argumentsText, " ")
+
+			local cleanArgs = {}
+			for _, v in ipairs(args) do
+				if v ~= "" then table.insert(cleanArgs, v) end
+			end
+
+			local itemNumber = tonumber(cleanArgs[1])
+			local spawnAmount = tonumber(cleanArgs[2]) or 1 
+
+			if itemNumber and itemDatabase[itemNumber] then
+				local itemData = itemDatabase[itemNumber]
+
+				local existingStack = nil
+				local targetSlot = nil
+				for i = 1, 72 do
+					local slotCheck = getSlot(i)
+					if slotCheck then
+						local itemFrame = slotCheck:FindFirstChild(itemData.name)
+						if itemFrame then existingStack = itemFrame break end
+					end
+				end
+				for i = 1, 72 do
+					local slotCheck = getSlot(i)
+					if slotCheck then
+						local hasAnItem = false
+						for _, child in ipairs(slotCheck:GetChildren()) do
+							if child:IsA("Frame") and child.Name ~= "Background" then
+								hasAnItem = true
+								break
+							end
+						end
+						if not hasAnItem then targetSlot = slotCheck break end
+					end
+				end
+
+				if existingStack then
+					local currentAmount = existingStack:GetAttribute("Amount") or 1
+					local newAmount = currentAmount + spawnAmount
+
+					existingStack:SetAttribute("Amount", newAmount)
+					local countLabel = existingStack:FindFirstChild("CountLabel")
+					if countLabel then
+						countLabel.Text = tostring(newAmount)
+						countLabel.Visible = true
+					end
+
+					SaveInventoryEvent:FireServer("UpdateSlot", existingStack.Parent.Name, existingStack.Name, newAmount)
+					return
+				end
+
+				local targetSlot = nil
+				for i = 1, 72 do
+					local slotCheck = getSlot(i)
+					if slotCheck then
+						local hasAnItem = false
+						for _, child in ipairs(slotCheck:GetChildren()) do
+							if child:IsA("Frame") and child.Name ~= "Background" then
+								hasAnItem = true
+								break
+							end
+						end
+						if not hasAnItem then targetSlot = slotCheck break end
+					end
+				end
+
+				if targetSlot then
+					local newItem = createItemVisual(itemData.name, itemData.color, targetSlot, spawnAmount)
+					makeElementDraggable(newItem)
+					SaveInventoryEvent:FireServer("UpdateSlot", targetSlot.Name, newItem.Name, spawnAmount)
+				end
+			end
+			-- 🦅 FLY COMMAND
+		elseif string.sub(chatText, 1, 5) == "/fly" then
+			isFlying = not isFlying -- Flip the switch (true becomes false, false becomes true)
+			local character = player.Character
+			local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+
+			if humanoid then
+				humanoid.PlatformStand = isFlying
+				if isFlying then
+					print("🦅 Fly Mode: ENABLED! Use W, A, S, D, Space (Up), and Shift (Down) to move.")
+				else
+					print("🚶 Fly Mode: DISABLED. Normal walking restored.")
+				end
+			end
+		end
+
+
+	end
+
+end
+
+-- Listen for successful mining rewards
+MineResourceEvent.OnClientEvent:Connect(function(itemIdentifier, spawnAmount)
+	spawnAmount = spawnAmount or 1
+
+	-- 🛡️ MAGIC TRANSLATOR: Force it to be a real number!
+	local itemNumber = tonumber(itemIdentifier)
+
+	-- 🎯 Look up the item in our database using the NUMBER the server sent us
+	if itemNumber and itemDatabase[itemNumber] then
+		local itemData = itemDatabase[itemNumber]
+		local existingStack = nil
+
+		-- 1. Check if we already have this item to stack it
+		for i = 1, 72 do
+			local slotCheck = getSlot(i)
+			if slotCheck then
+				local itemFrame = slotCheck:FindFirstChild(itemData.name)
+				if itemFrame then 
+					existingStack = itemFrame 
+					break 
+				end
+			end
+		end
+
+		if existingStack then
+			local currentAmount = existingStack:GetAttribute("Amount") or 1
+			local newAmount = currentAmount + spawnAmount
+			existingStack:SetAttribute("Amount", newAmount)
+			local countLabel = existingStack:FindFirstChild("CountLabel")
+			if countLabel then
+				countLabel.Text = tostring(newAmount)
+				countLabel.Visible = true
+			end
+			-- Tell the server to save the CORRECT NAME (e.g., "Dirt", not "Infinite Dirt")
+			SaveInventoryEvent:FireServer("UpdateSlot", existingStack.Parent.Name, existingStack.Name, newAmount)
+			return
+		end
+
+		-- 2. If we don't have it, find an empty slot
+		local targetSlot = nil
+		for i = 1, 72 do
+			local slotCheck = getSlot(i)
+			if slotCheck then
+				local hasAnItem = false
+				for _, child in ipairs(slotCheck:GetChildren()) do
+					if child:IsA("Frame") and child.Name ~= "Background" then
+						hasAnItem = true
+						break
+					end
+				end
+				if not hasAnItem then 
+					targetSlot = slotCheck 
+					break 
+				end
+			end
+		end
+
+		-- 3. Create the visual and tell the server to save it
+		if targetSlot then
+			local newItem = createItemVisual(itemData.name, itemData.color, targetSlot, spawnAmount)
+			makeElementDraggable(newItem)
+			-- Tell the server to save the CORRECT NAME
+			SaveInventoryEvent:FireServer("UpdateSlot", targetSlot.Name, newItem.Name, spawnAmount)
+		end
+	else
+		warn("⚠️ Client could not find item in database for Number ID: " .. tostring(itemNumber))
+	end
+end)
+
+-- ========================================================
+-- CORE MOUSE ENGINE (Targeting & Snap Formulas)
+-- ========================================================
+local mouse = player:GetMouse()
+mouse.TargetFilter = player.Character
+
+local function getMouseTarget()
+	local targetPart = mouse.Target
+	if not targetPart then return nil end
+
+	local activeMapFolder = workspace:FindFirstChild("ActiveMap")
+	if activeMapFolder and targetPart:IsDescendantOf(activeMapFolder) then
+		local blockModel = targetPart:FindFirstAncestorOfClass("Model")
+		if blockModel and blockModel.Parent == activeMapFolder then
+			return blockModel 
+		end
+	end
+
+	local current = targetPart
+	while current and current ~= workspace do
+		if current:GetAttribute("ItemRewardID") then return current end
+		current = current.Parent
+	end
+	return nil
+end
+
+
+local isPlacing = false
+local currentPreviewModel = nil
+local activePlacementBlockName = ""
+local currentRotation = 0
+local baseAnchorOffset = Vector3.zero
+
+-- ========================================================
+-- PLACEMENT CONTROLLERS (Bypasses Roblox Tools)
+-- ========================================================
+stopPlacementMode = function()
+	isPlacing = false
+	activePlacementBlockName = ""
+	if currentPreviewModel then
+		currentPreviewModel:Destroy()
+		currentPreviewModel = nil
+		print("🔌 Placement preview cleaned up.")
+	end
+	currentRotation = 0
+end
+
+local function startPlacementMode(itemName)
+	stopPlacementMode()
+	local matchingTemplate = ItemTemplates:FindFirstChild(itemName)
+	if matchingTemplate then
+		isPlacing = true
+		activePlacementBlockName = itemName
+		currentPreviewModel = matchingTemplate:Clone()
+		currentPreviewModel.Name = "PlacementPreview"
+		for _, part in ipairs(currentPreviewModel:GetDescendants()) do
+			if part:IsA("BasePart") then
+				part.Transparency = 0.5
+				part.CanCollide = false
+				part.CanTouch = false
+				part.CanQuery = false
+			end
+		end
+		currentPreviewModel.Parent = workspace
+		local anchor = currentPreviewModel:FindFirstChild("FixedLocation")
+		if anchor then
+			baseAnchorOffset = currentPreviewModel:GetPivot().Position - anchor.Position
+		else
+			baseAnchorOffset = Vector3.zero
+		end
+
+		-- 🆕 Cache these once at start instead of recalculating every frame
+		cachedPreviewDescendants = currentPreviewModel:GetDescendants()
+		previewHasBoundaries = false
+		for _, part in ipairs(cachedPreviewDescendants) do
+			if part:IsA("BasePart") and part.Name:match("^TransparentBoundary") then
+				previewHasBoundaries = true
+				break
+			end
+		end
+		cachedActiveMapChildren = nil -- reset so it gets refreshed on next frame
+		lastSnappedPosition = nil
+	end
+end
+
+local function getRequiredMineTime(resourceModel)
+	local baseTime = resourceModel:GetAttribute("BaseMineTime") or 5.0
+	local toolPower = 1 -- Defaults to bare hands speed
+
+	-- 🔍 DYNAMIC TOOL CHECKER:
+	local character = player.Character
+	local equippedTool = character and character:FindFirstChildOfClass("Tool")
+
+	if equippedTool then
+		-- Pull the dynamic speed attribute from the tool instance (defaults to 1 if missing)
+		toolPower = equippedTool:GetAttribute("MiningSpeed") or 1
+		print("🎒 CLIENT MATH: Found equipped tool '" .. equippedTool.Name .. "' with ToolPower: " .. tostring(toolPower))
+	else
+		print("🎒 CLIENT MATH: No physical tool found in character model. Defaulting to bare hands (ToolPower: 1)")
+	end
+
+	-- Apply the exact game formula
+	local finalDuration = (baseTime / toolPower) * localHasteMultiplier
+	print(string.format("📊 CLIENT MATH CHECK: Base(%s) / ToolPower(%s) * HasteMult(%s) = Target Hold: %ss", 
+		tostring(baseTime), tostring(toolPower), tostring(localHasteMultiplier), tostring(finalDuration)))
+
+	return math.max(0.1, finalDuration)
+end
+
+-- ========================================================
+-- CLICK-AND-HOLD / PLACEMENT / CONSUMPTION PROCESSOR
+-- ========================================================
+local isClicking = false
+local mineTarget = nil
+local holdStartTime = 0
+local holdDurationNeeded = 5
+activeEquippedItemName = ""
+
+
+
+UserInputService.InputBegan:Connect(function(input, gameProcessedEvent)
+	if gameProcessedEvent then return end
+
+	if input.KeyCode == Enum.KeyCode.R and isPlacing and currentPreviewModel then
+		currentRotation = (currentRotation + 90) % 360
+		print("Rotation:", currentRotation)
+
+		return
+	end
+
+	if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+
+		if isPlacing and currentPreviewModel then
+			if not canPlaceHere then 
+				print("❌ Cannot place block: Position is invalid!")
+				return 
+			end
+
+			-- 1. Grab model dimensions and mouse surface vector maps
+			local modelCFrame, previewSize = currentPreviewModel:GetBoundingBox()
+			local raycastParams = RaycastParams.new()
+			raycastParams.FilterDescendantsInstances = {currentPreviewModel, player.Character}
+			raycastParams.FilterType = Enum.RaycastFilterType.Exclude
+			local rayResult = workspace:Raycast(mouse.UnitRay.Origin, mouse.UnitRay.Direction * 1000, raycastParams)
+			local surfaceNormal = rayResult and rayResult.Normal or Vector3.FromNormalId(mouse.TargetSurface)
+
+			-- Find where a regular 4x4 block would snap on this target surface face
+			local baseOffset = surfaceNormal * (GRID_SIZE / 2)
+			local rawHit = mouse.Hit.Position
+			local targetPoint = rawHit + baseOffset
+
+			-- Calculate a snapped 4x4 grid coordinate point representing the primary anchor cell
+			local snappedCornerCell = snapToGrid(targetPoint)
+
+
+
+			local cellsX = math.max(1, math.round(previewSize.X / GRID_SIZE))
+			local cellsY = math.max(1, math.round(previewSize.Y / GRID_SIZE))
+			local cellsZ = math.max(1, math.round(previewSize.Z / GRID_SIZE))
+
+			local offsetX = surfaceNormal.X ~= 0 and (surfaceNormal.X * (cellsX - 1) * GRID_SIZE / 2) or ((cellsX - 1) * GRID_SIZE / 2)
+			local offsetY = surfaceNormal.Y ~= 0 and (surfaceNormal.Y * (cellsY - 1) * GRID_SIZE / 2) or ((cellsY - 1) * GRID_SIZE / 2)
+			local offsetZ = surfaceNormal.Z ~= 0 and (surfaceNormal.Z * (cellsZ - 1) * GRID_SIZE / 2) or ((cellsZ - 1) * GRID_SIZE / 2)
+
+			local finalModelCenter = Vector3.new(
+				math.round((snappedCornerCell.X + offsetX) / GRID_SIZE) * GRID_SIZE,
+				math.round((snappedCornerCell.Y + offsetY) / GRID_SIZE) * GRID_SIZE,
+				math.round((snappedCornerCell.Z + offsetZ) / GRID_SIZE) * GRID_SIZE
+			)
+			-- Use actual preview bounding box position for accurate cell registration
+			local previewBoundingCFrame, _ = currentPreviewModel:GetBoundingBox()
+			local previewCenter = Vector3.new(
+				math.round(previewBoundingCFrame.Position.X / GRID_SIZE) * GRID_SIZE,
+				math.round(previewBoundingCFrame.Position.Y / GRID_SIZE) * GRID_SIZE,
+				math.round(previewBoundingCFrame.Position.Z / GRID_SIZE) * GRID_SIZE
+			)
+			local targetCells = getModelOccupiedCells(currentPreviewModel, previewBoundingCFrame.Position, previewSize)
+
+			print("previewSize:", previewSize)
+			print("previewCenter:", previewCenter)
+			print("targetCells count:", #targetCells)
+
+			-- 🎯 DESTRUCTION HOOK: Find and clear old blocks inside targeted cells
+			for _, key in ipairs(targetCells) do
+				local existingInstance = OccupiedGrids[key]
+				if existingInstance and typeof(existingInstance) == "Instance" then
+					for k, v in pairs(OccupiedGrids) do
+						if v == existingInstance then
+							OccupiedGrids[k] = nil
+						end
+					end
+					existingInstance:Destroy()
+				end
+			end
+
+			-- Store placeholder so RenderStepped doesn't immediately allow overlapping placement
+			for _, key in ipairs(targetCells) do
+				OccupiedGrids[key] = activePlacementBlockName
+			end
+
+			local rotationCFrame = CFrame.Angles(0, math.rad(currentRotation), 0)
+			local anchorCheck = currentPreviewModel:FindFirstChild("FixedLocation")
+			if anchorCheck then
+				PlaceBlockEvent:FireServer(activePlacementBlockName, CFrame.new(snappedCornerCell) * rotationCFrame)
+			else
+				PlaceBlockEvent:FireServer(activePlacementBlockName, CFrame.new(finalModelCenter) * rotationCFrame)
+			end
+			return
+		end
+
+		-- 🧪 OPERATION B: Potion Drinking Hold Engine
+		local character = player.Character
+		local equippedTool = character and character:FindFirstChildOfClass("Tool")
+		local physicalToolName = equippedTool and equippedTool.Name or ""
+
+		if string.match(activeEquippedItemName, "Haste Potion") or string.match(physicalToolName, "Haste Potion") then
+			isClicking = true
+			holdStartTime = os.clock()
+			holdDurationNeeded = 1.0 * localHasteMultiplier 
+
+			local potionName = activeEquippedItemName ~= "" and activeEquippedItemName or physicalToolName
+			print("🧪 Started drinking " .. potionName .. ". Hold for: " .. holdDurationNeeded .. "s")
+
+			task.spawn(function()
+				while isClicking do
+					local currentTool = character and character:FindFirstChildOfClass("Tool")
+					local currentToolName = currentTool and currentTool.Name or ""
+					if activeEquippedItemName == "" and not string.match(currentToolName, "Potion") then
+						print("❌ Potion unequipped mid-drink. Cancelling loop.")
+						break
+					end
+
+					local elapsed = os.clock() - holdStartTime
+					if elapsed >= holdDurationNeeded then
+						local finalizedPotionName = activeEquippedItemName ~= "" and activeEquippedItemName or currentToolName
+						print("✅ Finished drinking potion: " .. finalizedPotionName)
+
+						local slotStringKey = "hotbar" .. tostring(currentlySelectedSlot or 1)
+						currentlySelectedSlot = nil
+						activeEquippedItemName = ""
+						stopPlacementMode()
+
+						UsePotionEvent:FireServer("USE_POTION_ACTION", slotStringKey)
+						isClicking = false
+						break
+					end
+					task.wait(0.1)
+				end
+			end)
+			return
+		end
+
+		-- ⛏️ OPERATION C: Continuous Mining Node System
+		local targetResource = getMouseTarget()
+		if targetResource then
+			isClicking = true
+			mineTarget = targetResource
+			holdStartTime = os.clock()
+			holdDurationNeeded = getRequiredMineTime(targetResource)
+
+			print("⛏️ Started mining " .. targetResource.Name .. ". Requires: " .. holdDurationNeeded .. "s")
+
+			task.spawn(function()
+				while isClicking do
+					local currentTool = character and character:FindFirstChildOfClass("Tool")
+					local toolNameLower = currentTool and currentTool.Name:lower() or ""
+
+					if not currentTool or not (string.match(toolNameLower, "pickaxe") or string.match(toolNameLower, "drill") or string.match(toolNameLower, "shovel")) then
+						print("❌ Valid tool unequipped. Stopping continuous mine.")
+						isClicking = false
+						mineTarget = nil
+						break
+					end
+
+					local liveMouseTarget = getMouseTarget()
+
+					if liveMouseTarget and mineTarget and liveMouseTarget ~= mineTarget then
+						mineTarget = liveMouseTarget
+						holdStartTime = os.clock() 
+						holdDurationNeeded = getRequiredMineTime(liveMouseTarget)
+						print("🎯 Cursor moved! Swapped tracking to new block: " .. liveMouseTarget.Name)
+					end
+
+					if not mineTarget or not mineTarget.Parent then
+						if liveMouseTarget then
+							mineTarget = liveMouseTarget
+							holdStartTime = os.clock()
+							holdDurationNeeded = getRequiredMineTime(liveMouseTarget)
+							print("🔄 Auto-targeting next block: " .. liveMouseTarget.Name)
+						else
+							task.wait(0.05)
+							continue
+						end
+					end
+
+					-- Check time elapsed
+					local elapsed = os.clock() - holdStartTime
+					if elapsed >= holdDurationNeeded then
+						print("✅ Successfully mined node: " .. mineTarget.Name)
+
+						-- ♾️ INFINITE BLOCK CHECK: Don't clear the grid if it's supposed to stay forever!
+						local isInfinite = mineTarget:GetAttribute("IsInfinite") == true
+
+						if not isInfinite then
+							-- 🎯 THE CLIENT CELL EMPTIED FIX:
+							-- Scan OccupiedGrids directly for any keys pointing at this exact instance and wipe them all
+							for key, registeredInstance in pairs(OccupiedGrids) do
+								if registeredInstance == mineTarget or registeredInstance == mineTarget.Name or registeredInstance == true then
+									OccupiedGrids[key] = nil
+								end
+							end
+						end
+
+						MineResourceEvent:FireServer(mineTarget)
+						mineTarget = nil
+					end
+
+					task.wait(0.02)
+				end
+			end)
+		end
+	end
+end)
+
+UserInputService.InputEnded:Connect(function(input)
+	if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+		if isClicking then
+			isClicking = false
+			mineTarget = nil
+			print("❌ Input released: Continuous action stopped.")
+		end
+	end
+end)
+
+-- ========================================================
+-- 6. HOTBAR KEY LISTENER (Equipping Blocks, Tools & Potions)
+-- ========================================================
+UserInputService.InputBegan:Connect(function(input, gameProcessedEvent)
+	if gameProcessedEvent then return end
+
+	-- 🔒 GLOBAL LOCKOUT: Ignore clicks, hotbar keys, and placement toggles until loaded
+	if not player:GetAttribute("WorldLoaded") then return end
+
+	if input.UserInputType == Enum.UserInputType.Keyboard then
+		local keyCode = input.KeyCode
+		local targetSlotNumber = nil
+
+		if keyCode == Enum.KeyCode.One then targetSlotNumber = 1
+		elseif keyCode == Enum.KeyCode.Two then targetSlotNumber = 2
+		elseif keyCode == Enum.KeyCode.Three then targetSlotNumber = 3
+		elseif keyCode == Enum.KeyCode.Four then targetSlotNumber = 4
+		elseif keyCode == Enum.KeyCode.Five then targetSlotNumber = 5
+		elseif keyCode == Enum.KeyCode.Six then targetSlotNumber = 6
+		elseif keyCode == Enum.KeyCode.Seven then targetSlotNumber = 7
+		elseif keyCode == Enum.KeyCode.Eight then targetSlotNumber = 8
+		elseif keyCode == Enum.KeyCode.Nine then targetSlotNumber = 9
+		end
+
+		if targetSlotNumber then
+			if currentlySelectedSlot == targetSlotNumber then
+				currentlySelectedSlot = nil 
+				activeEquippedItemName = ""
+				stopPlacementMode() 
+				MineResourceEvent:FireServer("EQUIP_TOOL_ACTION", "Clear")
+				print("⌨️ Re-selected slot " .. targetSlotNumber .. ": Unequipped item.")
+				return 
+			end
+
+			local targetSlot = cellConstraint2:FindFirstChild("hotbar" .. targetSlotNumber)
+			if targetSlot then
+				local itemFrame = nil
+				for _, child in ipairs(targetSlot:GetChildren()) do
+					if child:IsA("Frame") then 
+						itemFrame = child 
+						break 
+					end
+				end
+
+				if itemFrame then
+					currentlySelectedSlot = targetSlotNumber
+					activeEquippedItemName = itemFrame.Name
+					MineResourceEvent:FireServer("EQUIP_TOOL_ACTION", itemFrame.Name)
+
+					-- If this is a placeable block model blueprint, trigger placement matrix
+					if ItemTemplates:FindFirstChild(itemFrame.Name) then
+						startPlacementMode(itemFrame.Name)
+					else
+						stopPlacementMode() -- Reset if it's a tool or potion
+					end
+				else
+					currentlySelectedSlot = nil
+					activeEquippedItemName = ""
+					stopPlacementMode()
+					MineResourceEvent:FireServer("EQUIP_TOOL_ACTION", "Clear")
+				end
+			end
+		end
+	end
+end)
+
+
+-- Global settings for your new engine
+local MARGIN = 0.05 -- Your requested margin of error (in studs)
+
+
+
+RunService.RenderStepped:Connect(function()
+
+	-- 🔒 GLOBAL LOCKOUT: Do absolutely nothing if the world hasn't loaded yet
+	if not player:GetAttribute("WorldLoaded") then
+		canPlaceHere = false
+		if currentPreviewModel then
+			currentPreviewModel.Parent = nil -- Hide preview if it somehow exists
+		end
+		if SelectionBox then
+			SelectionBox.Adornee = nil -- Clear outlines
+		end
+		return 
+	end
+
+	local character = player.Character
+	local isAlive = character and character:FindFirstChild("HumanoidRootPart") and character:FindFirstChildOfClass("Humanoid") and character.Humanoid.Health > 0
+	-- 🦅 FLYING MOVEMENT ENGINE
+	if isFlying and character and character:FindFirstChild("HumanoidRootPart") then
+		local hrp = character.HumanoidRootPart
+		local humanoid = character:FindFirstChildOfClass("Humanoid")
+
+		-- Ensure PlatformStay stays on in case the player reset
+		if humanoid then humanoid.PlatformStand = true end
+
+		local flySpeed = 60 -- How fast you fly (studs per second)
+		local moveDirection = Vector3.new(0, 0, 0)
+		local cameraDirection = camera.CFrame.LookVector
+
+		-- Read keyboard inputs
+		if UserInputService:IsKeyDown(Enum.KeyCode.W) then moveDirection = moveDirection + cameraDirection end
+		if UserInputService:IsKeyDown(Enum.KeyCode.S) then moveDirection = moveDirection - cameraDirection end
+		if UserInputService:IsKeyDown(Enum.KeyCode.A) then moveDirection = moveDirection - camera.CFrame.RightVector end
+		if UserInputService:IsKeyDown(Enum.KeyCode.D) then moveDirection = moveDirection + camera.CFrame.RightVector end
+		if UserInputService:IsKeyDown(Enum.KeyCode.Space) then moveDirection = moveDirection + Vector3.new(0, 1, 0) end
+		if UserInputService:IsKeyDown(Enum.KeyCode.LeftShift) then moveDirection = moveDirection - Vector3.new(0, 1, 0) end
+
+		-- Apply the movement smoothly
+		if moveDirection.Magnitude > 0 then
+			hrp.AssemblyLinearVelocity = moveDirection.Unit * flySpeed
+		else
+			hrp.AssemblyLinearVelocity = Vector3.new(0, 0, 0) -- Stop completely if no keys are pressed
+		end
+	end
+	local equippedTool = isAlive and character:FindFirstChildOfClass("Tool")
+
+	-- Progress Bar UI Math
+	if isClicking and mineTarget and mineTarget.Parent and isAlive then
+		local elapsed = os.clock() - holdStartTime
+		local progressPercent = math.clamp(elapsed / holdDurationNeeded, 0, 1)
+		ProgressBarFill.Size = UDim2.new(progressPercent, 0, 1, 0)
+		ProgressText.Text = string.format("%d%%", math.floor(progressPercent * 100))
+		ProgressBarBackground.Visible = true
+	else
+		ProgressBarBackground.Visible = false
+	end
+
+
+	local toolNameLower = equippedTool and equippedTool.Name:lower() or ""
+
+	-- 🎯 Check if the player is holding a tool that should highlight blocks on hover
+	local isHoldingValidMiningTool = string.match(toolNameLower, "pickaxe") 
+		or string.match(toolNameLower, "drill") 
+		or string.match(toolNameLower, "shovel")
+
+	if mouse.Target then
+		local targetPart = mouse.Target
+		local isValidSurface = targetPart and targetPart:IsDescendantOf(workspace) and not targetPart:IsDescendantOf(character)
+
+		if isValidSurface then
+			-- Initialize SelectionBox UI elements if they don't exist yet
+			if not SelectionBox or SelectionBox.Parent == nil then
+				SelectionBox = Instance.new("SelectionBox")
+				SelectionBox.Name = "HoverOutline"
+				SelectionBox.LineThickness = 0.01
+				SelectionBox.Parent = playergui
+			end
+
+
+
+			-- ENGINE BRANCH A: Placement Mode Logic
+			if isPlacing and currentPreviewModel then
+				mouse.TargetFilter = currentPreviewModel
+
+
+				-- 1. Grab model dimensions and mouse surface vectors
+				local modelCFrame, previewSize = currentPreviewModel:GetBoundingBox()
+				placementRaycastParams.FilterDescendantsInstances = {currentPreviewModel, player.Character}
+				local rayResult = workspace:Raycast(mouse.UnitRay.Origin, mouse.UnitRay.Direction * 1000, placementRaycastParams)
+				local surfaceNormal = rayResult and rayResult.Normal or Vector3.FromNormalId(mouse.TargetSurface)
+
+				-- Find where a regular 4x4 block would snap on this target surface face
+				local baseOffset = surfaceNormal * (GRID_SIZE / 2)
+				local rawHit = mouse.Hit.Position
+				local targetPoint = rawHit + baseOffset
+
+				-- Calculate a snapped 4x4 grid coordinate point representing the primary anchor cell
+				local snappedCornerCell = snapToGrid(targetPoint)
+
+				-- Push the block center away from the surface along each axis the normal faces.
+				-- On axes the normal doesn't affect, center the block on the anchor cell normally.
+				local cellsX = math.max(1, math.round(previewSize.X / GRID_SIZE))
+				local cellsY = math.max(1, math.round(previewSize.Y / GRID_SIZE))
+				local cellsZ = math.max(1, math.round(previewSize.Z / GRID_SIZE))
+
+				local offsetX = surfaceNormal.X ~= 0 and (surfaceNormal.X * (cellsX - 1) * GRID_SIZE / 2) or ((cellsX - 1) * GRID_SIZE / 2)
+				local offsetY = surfaceNormal.Y ~= 0 and (surfaceNormal.Y * (cellsY - 1) * GRID_SIZE / 2) or ((cellsY - 1) * GRID_SIZE / 2)
+				local offsetZ = surfaceNormal.Z ~= 0 and (surfaceNormal.Z * (cellsZ - 1) * GRID_SIZE / 2) or ((cellsZ - 1) * GRID_SIZE / 2)
+
+				local finalModelCenter = Vector3.new(
+					math.round((snappedCornerCell.X + offsetX) / GRID_SIZE) * GRID_SIZE,
+					math.round((snappedCornerCell.Y + offsetY) / GRID_SIZE) * GRID_SIZE,
+					math.round((snappedCornerCell.Z + offsetZ) / GRID_SIZE) * GRID_SIZE
+				)
+
+
+				local rotationCFrame = CFrame.Angles(0, math.rad(currentRotation), 0)
+				local anchor = currentPreviewModel:FindFirstChild("FixedLocation")
+				if anchor then
+					local rotatedOffset = rotationCFrame:VectorToWorldSpace(baseAnchorOffset)
+
+					currentPreviewModel:PivotTo(CFrame.new(snappedCornerCell + rotatedOffset) * rotationCFrame)
+					local newModelCFrame, _ = currentPreviewModel:GetBoundingBox()
+					finalModelCenter = Vector3.new(
+						math.round(newModelCFrame.Position.X / GRID_SIZE) * GRID_SIZE,
+						math.round(newModelCFrame.Position.Y / GRID_SIZE) * GRID_SIZE,
+						math.round(newModelCFrame.Position.Z / GRID_SIZE) * GRID_SIZE
+					)
+				else
+					local pivotOffset = currentPreviewModel:GetPivot():ToObjectSpace(modelCFrame)
+					currentPreviewModel:PivotTo(CFrame.new(finalModelCenter) * rotationCFrame * pivotOffset:Inverse())
+				end
+
+
+
+
+
+
+				-- Self-learning step: register block under mouse if not already tracked
+				if targetPart:IsDescendantOf(workspace:WaitForChild("ActiveMap")) then
+					local parentModel = targetPart:FindFirstAncestorOfClass("Model")
+					local actualInstance = parentModel or targetPart
+					-- 🆕 Use a direct name+position key instead of looping all OccupiedGrids
+					local instanceKey = tostring(actualInstance)
+					if not OccupiedGrids["__tracked_" .. instanceKey] then
+						OccupiedGrids["__tracked_" .. instanceKey] = true
+						local boundingCFrame, boundingSize
+						if actualInstance:IsA("Model") then
+							boundingCFrame, boundingSize = actualInstance:GetBoundingBox()
+						else
+							boundingCFrame = CFrame.new(actualInstance.Position)
+							boundingSize = actualInstance.Size
+						end
+						local blockCenter = Vector3.new(
+							math.round(boundingCFrame.Position.X / GRID_SIZE) * GRID_SIZE,
+							math.round(boundingCFrame.Position.Y / GRID_SIZE) * GRID_SIZE,
+							math.round(boundingCFrame.Position.Z / GRID_SIZE) * GRID_SIZE
+						)
+						local existingCells = getModelOccupiedCells(actualInstance, boundingCFrame.Position, boundingSize)
+						for _, key in ipairs(existingCells) do
+							OccupiedGrids[key] = actualInstance
+						end
+					end
+				end
+
+				-- 3. Check occupation using the preview's actual bounding box
+				local previewBoundingCFrame, previewBoundingSize = currentPreviewModel:GetBoundingBox()
+				local previewCenter = Vector3.new(
+					math.round(previewBoundingCFrame.Position.X / GRID_SIZE) * GRID_SIZE,
+					math.round(previewBoundingCFrame.Position.Y / GRID_SIZE) * GRID_SIZE,
+					math.round(previewBoundingCFrame.Position.Z / GRID_SIZE) * GRID_SIZE
+				)
+
+				--if clientBoundaryCount > 0 then
+				--print("✅ CLIENT DEBUG: Preview model has " .. clientBoundaryCount .. " TransparentBoundary parts. Using boundary system.")
+				--else
+				--print("⚠️ CLIENT DEBUG: Preview model has NO TransparentBoundary parts. Using bounding box fallback.")
+				--print("   Preview bounding size: " .. tostring(previewBoundingSize))
+				--end
+				-- ===== END DEBUG =====
+
+				local targetCells = getModelOccupiedCells(currentPreviewModel, previewBoundingCFrame.Position, previewBoundingSize)
+
+				-- ===== DEBUG: HOW MANY CELLS DOES THE PREVIEW OCCUPY? =====
+				-- print("📦 CLIENT DEBUG: Preview occupies " .. #targetCells .. " cells:")
+				--for _, key in ipairs(targetCells) do
+				--print("   → " .. key)
+				--end
+				-- ===== END DEBUG =====
+
+				local surfaceInstance = targetPart:FindFirstAncestorOfClass("Model") or targetPart
+				local isCellOccupied = false
+				for _, key in ipairs(targetCells) do
+					local v = OccupiedGrids[key]
+					if v ~= nil and v ~= true and v ~= activePlacementBlockName and v ~= surfaceInstance then
+						-- ===== DEBUG: WHICH CELL IS BLOCKING PLACEMENT? =====
+						print("🚫 CLIENT DEBUG: Cell " .. key .. " is occupied by: " .. tostring(v))
+						if typeof(v) == "Instance" then
+							print("   Blocking instance name: " .. v.Name)
+						end
+						-- ===== END DEBUG =====
+						isCellOccupied = true
+						break
+					end
+				end
+
+				local previewHasBoundaries = false
+				for _, part in ipairs(currentPreviewModel:GetDescendants()) do
+					if part:IsA("BasePart") and part.Name:match("^TransparentBoundary") then
+						previewHasBoundaries = true
+						break
+					end
+				end
+
+				if not isCellOccupied and not previewHasBoundaries then
+					local shrink = 0.01
+					local pMin = previewBoundingCFrame.Position - previewBoundingSize / 2 + Vector3.new(shrink, shrink, shrink)
+					local pMax = previewBoundingCFrame.Position + previewBoundingSize / 2 - Vector3.new(shrink, shrink, shrink)
+					local activeMap = workspace:FindFirstChild("ActiveMap")
+					if activeMap then
+						for _, instance in ipairs(activeMap:GetChildren()) do
+							-- 🆕 Skip blocks that use TransparentBoundary — their cells are already accurately registered
+							local hasBoundaries = boundaryBlockCache[instance]
+							if hasBoundaries == nil then
+								hasBoundaries = false
+								for _, part in ipairs(instance:GetDescendants()) do
+									if part:IsA("BasePart") and part.Name:match("^TransparentBoundary") then
+										hasBoundaries = true
+										break
+									end
+								end
+								boundaryBlockCache[instance] = hasBoundaries
+							end
+							if hasBoundaries then continue end
+							local isSurface = instance == surfaceInstance
+							local previewOverlapsSurface = false
+							if isSurface then
+								local bCFrame, bSize = instance:IsA("Model") and instance:GetBoundingBox() or CFrame.new(instance.Position), instance:IsA("Model") and select(2, instance:GetBoundingBox()) or instance.Size
+								local bMin = bCFrame.Position - bSize / 2
+								local bMax = bCFrame.Position + bSize / 2
+								previewOverlapsSurface = pMin.X < bMax.X - shrink and pMax.X > bMin.X + shrink and
+									pMin.Y < bMax.Y - shrink and pMax.Y > bMin.Y + shrink and
+									pMin.Z < bMax.Z - shrink and pMax.Z > bMin.Z + shrink
+							end
+							if not isSurface or previewOverlapsSurface then
+								local bCFrame, bSize = instance:IsA("Model") and instance:GetBoundingBox() or CFrame.new(instance.Position), instance:IsA("Model") and select(2, instance:GetBoundingBox()) or instance.Size
+								local bMin = bCFrame.Position - bSize / 2
+								local bMax = bCFrame.Position + bSize / 2
+								if pMin.X < bMax.X and pMax.X > bMin.X and
+									pMin.Y < bMax.Y and pMax.Y > bMin.Y and
+									pMin.Z < bMax.Z and pMax.Z > bMin.Z then
+									-- ===== DEBUG: OLD BOUNDING BOX CHECK IS BLOCKING =====
+									--print("🚫 CLIENT DEBUG: OLD BOUNDING BOX CHECK blocked placement!")
+									--print("   Blocking instance: " .. instance.Name)
+									--print("   Preview min: " .. tostring(pMin) .. " max: " .. tostring(pMax))
+									local bCFrame2, bSize2 = instance:IsA("Model") and instance:GetBoundingBox() or CFrame.new(instance.Position), instance:IsA("Model") and select(2, instance:GetBoundingBox()) or instance.Size
+									--print("   Blocker min: " .. tostring(bCFrame2.Position - bSize2/2) .. " max: " .. tostring(bCFrame2.Position + bSize2/2))
+									-- ===== END DEBUG =====
+									isCellOccupied = true
+									break
+								end
+							end
+						end
+					end
+				end 
+				-- 4. Check adjacency rule using the corrected coordinate bounds
+				-- 4. Check adjacency rule: check directly behind the mouse hit point, not the shifted model cells
+				local hasValidNeighbor = targetPart.Name == "Baseplate"
+				if not hasValidNeighbor then
+					local contactCell = snapToGrid(rawHit)
+					local cellOffset = surfaceNormal * GRID_SIZE
+					local cx, cy, cz = contactCell.X, contactCell.Y, contactCell.Z
+					local behindKey = string.format("%d,%d,%d", cx - cellOffset.X, cy - cellOffset.Y, cz - cellOffset.Z)
+					local contactKey = string.format("%d,%d,%d", cx, cy, cz)
+
+
+
+
+					if OccupiedGrids[behindKey] ~= nil then
+						hasValidNeighbor = true
+						--print("✅ NEIGHBOR DEBUG: Found via behindKey")
+					end
+					if not hasValidNeighbor then
+						if OccupiedGrids[contactKey] ~= nil then
+							hasValidNeighbor = true
+							--print("✅ NEIGHBOR DEBUG: Found via contactKey")
+						end
+					end
+					if not hasValidNeighbor then
+						--print("❌ NEIGHBOR DEBUG: Neither behindKey nor contactKey found. Checking distance fallback...")
+						for _, v in pairs(OccupiedGrids) do
+							if typeof(v) == "Instance" then
+								local model = v:IsA("Model") and v or v.Parent
+								if model then
+									local modelCFrame, modelSize = model:GetBoundingBox()
+									local modelPos = modelCFrame.Position
+									local distance = (Vector3.new(cx, cy, cz) - modelPos).Magnitude
+									if distance <= modelSize.Magnitude / 2 + GRID_SIZE then
+										hasValidNeighbor = true
+										break
+									end
+								end
+							end
+						end
+					end
+				end
+
+				-- 5. 🎯 MULTI-CELL COLLISION FORBID ENGINE
+				-- If ANY cell inside the footprint is occupied, we must treat the position as completely invalid
+				if hasValidNeighbor and not isCellOccupied then
+					canPlaceHere = true
+
+					-- Turn preview model translucent white to indicate placement is completely clear
+					for _, part in pairs(currentPreviewModel:GetDescendants()) do
+						if part:IsA("BasePart") then
+							part.Color = Color3.fromRGB(255, 255, 255)
+							part.Transparency = 0 -- Fully opaque / visible
+						end
+					end
+
+					-- Highlight target face part green
+					SelectionBox.Color3 = Color3.fromRGB(75, 255, 75)
+					SelectionBox.Adornee = targetPart
+				else
+					-- Forbids placement if there's no valid neighbor OR if any single cell is collided/blocked!
+					canPlaceHere = false
+					SelectionBox.Adornee = nil
+
+					-- Turn preview model translucent RED to warn the builder of a structural collision
+					for _, part in pairs(currentPreviewModel:GetDescendants()) do
+						if part:IsA("BasePart") then
+							part.Color = Color3.fromRGB(255, 75, 75)
+							part.Transparency = 0.5
+						end
+					end
+				end
+
+				-- ENGINE BRANCH B: Holding a Mining Tool Mode (No Placement Active)
+			elseif isHoldingValidMiningTool and targetPart:IsDescendantOf(workspace:WaitForChild("ActiveMap")) and targetPart.Name ~= "Baseplate" then
+				canPlaceHere = false
+
+				-- Turn the outline a clean white or light blue to show you are targeting a minable block
+				SelectionBox.Color3 = Color3.fromRGB(255, 255, 255)
+
+				-- If the part belongs to a Model block, outline the whole model. Otherwise outline the single part.
+				local visualTarget = targetPart.Parent:IsA("Model") and targetPart.Parent or targetPart
+				SelectionBox.Adornee = visualTarget
+			else
+				-- No valid tool held and not placing anything: Turn off outline completely
+				canPlaceHere = false
+				SelectionBox.Adornee = nil
+			end
+		else
+			canPlaceHere = false
+			if SelectionBox then SelectionBox.Adornee = nil end
+		end
+	else
+		canPlaceHere = false
+		if SelectionBox then SelectionBox.Adornee = nil end
+	end
+end)
