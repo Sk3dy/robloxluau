@@ -1,0 +1,23 @@
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Players = game:GetService("Players")
+local RequestWorldLoadEvent = ReplicatedStorage:WaitForChild("RequestWorldLoadEvent")
+
+local player = Players.LocalPlayer
+local button = script.Parent
+
+-- Set a default state directly on the player object so other scripts can read it
+player:SetAttribute("WorldLoaded", false)
+
+-- 1. Click the button to request a world load
+button.MouseButton1Click:Connect(function()
+	button.Visible = false 
+	player:SetAttribute("WorldLoaded", true) -- 🔓 Unlock local permissions for this player!
+	RequestWorldLoadEvent:FireServer()
+end)
+
+-- 2. Listen for server lock signals to clear the button for other players
+RequestWorldLoadEvent.OnClientEvent:Connect(function(action)
+	if action == "LockButton" then
+		button.Visible = false
+	end
+end)
