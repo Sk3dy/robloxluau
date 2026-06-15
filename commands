@@ -1,3 +1,5 @@
+-- localscript in starterplayerscripts
+
 local Players = game:GetService("Players")
 local TextChatService = game:GetService("TextChatService")
 local UserInputService = game:GetService("UserInputService")
