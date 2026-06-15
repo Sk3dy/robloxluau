@@ -1,3 +1,5 @@
+-- localscript in replicatedstorage
+
 local ProximityPromptService = game:GetService("ProximityPromptService")
 local TweenService = game:GetService("TweenService")
 local Players = game:GetService("Players")
