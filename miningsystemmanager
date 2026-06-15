@@ -1,0 +1,519 @@
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local MineResourceEvent = ReplicatedStorage:WaitForChild("MineResourceEvent")
+local SaveInventoryEvent = ReplicatedStorage:WaitForChild("SaveInventory")
+local ItemTemplates = ReplicatedStorage:WaitForChild("ItemTemplates")
+
+local InventorySessionManager = require(ReplicatedStorage:WaitForChild("InventorySessionManager"))
+
+_G.ServerOccupiedGrids = _G.ServerOccupiedGrids or {}
+_G.DestroyedWorldBlocks = _G.DestroyedWorldBlocks or {} -- 🆕 Shared with worldsave
+local GRID_SIZE = 4
+
+-- 🆕 Converts any world coordinate into its grid cell index (an integer)
+local function worldToCellIndex(value)
+	return math.floor(value / GRID_SIZE)
+end
+
+local function getServerOccupiedCells(centerPos: Vector3, modelSize: Vector3)
+	local cells = {}
+	local stepsX = math.max(1, math.round(modelSize.X / GRID_SIZE))
+	local stepsY = math.max(1, math.round(modelSize.Y / GRID_SIZE))
+	local stepsZ = math.max(1, math.round(modelSize.Z / GRID_SIZE))
+
+	-- Use the RAW (unrounded) bounding box center to find the true left/bottom/back edge
+	local minX = centerPos.X - (modelSize.X / 2)
+	local minY = centerPos.Y - (modelSize.Y / 2)
+	local minZ = centerPos.Z - (modelSize.Z / 2)
+
+	for x = 0, stepsX - 1 do
+		for y = 0, stepsY - 1 do
+			for z = 0, stepsZ - 1 do
+				-- 🆕 Round EACH cell independently to the same lattice as TransparentBoundary (multiples of GRID_SIZE)
+				local cellCenterX = math.round((minX + (x + 0.5) * GRID_SIZE) / GRID_SIZE) * GRID_SIZE
+				local cellCenterY = math.round((minY + (y + 0.5) * GRID_SIZE) / GRID_SIZE) * GRID_SIZE
+				local cellCenterZ = math.round((minZ + (z + 0.5) * GRID_SIZE) / GRID_SIZE) * GRID_SIZE
+				local key = string.format("%d,%d,%d", cellCenterX, cellCenterY, cellCenterZ)
+				table.insert(cells, key)
+			end
+		end
+	end
+	return cells
+end
+
+local function getModelOccupiedCells(model, centerPos, size)
+	local boundaries = {}
+	for _, part in ipairs(model:GetDescendants()) do
+		if part:IsA("BasePart") and part.Name:match("^TransparentBoundary") then
+			table.insert(boundaries, part)
+		end
+	end
+
+	if #boundaries > 0 then
+		local cells = {}
+		for _, part in ipairs(boundaries) do
+			local pos = part.Position
+			-- 🔧 Snap to world-coordinate grid lines (NOT divided indices)
+			-- so this matches the key format used by getServerOccupiedCells
+			local snappedX = math.round(pos.X / GRID_SIZE) * GRID_SIZE
+			local snappedY = math.round(pos.Y / GRID_SIZE) * GRID_SIZE
+			local snappedZ = math.round(pos.Z / GRID_SIZE) * GRID_SIZE
+
+			table.insert(cells, string.format("%d,%d,%d", snappedX, snappedY, snappedZ))
+		end
+		return cells
+	end
+
+	-- Fallback: no TransparentBoundary parts found, use existing bounding-box method
+	return getServerOccupiedCells(centerPos, size)
+end
+
+-- ========================================================
+-- 🌱 GROWTH SYSTEM: Turns a placed block into another block after a delay
+-- ========================================================
+local function growBlock(player, userId, oldBlock, growIntoName)
+	-- Safety check: if the block was mined/destroyed before it could grow, do nothing
+	if not oldBlock or not oldBlock.Parent then
+		print("🌱 Growth cancelled: block no longer exists.")
+		return
+	end
+
+	local template = ItemTemplates:FindFirstChild(growIntoName)
+	if not template then
+		warn("⚠️ Cannot grow - no template found for " .. growIntoName)
+		return
+	end
+
+	-- Get the old block's position and rotation before removing it
+	local oldPivot = oldBlock:GetPivot()
+	local oldCFrame, oldSize = oldBlock:GetBoundingBox()
+	local oldCenter = Vector3.new(
+		math.round(oldCFrame.Position.X / GRID_SIZE) * GRID_SIZE,
+		math.round(oldCFrame.Position.Y / GRID_SIZE) * GRID_SIZE,
+		math.round(oldCFrame.Position.Z / GRID_SIZE) * GRID_SIZE
+	)
+	local oldCells = getModelOccupiedCells(oldBlock, oldCFrame.Position, oldSize)
+
+	-- 🧹 Free up the old block's cells
+	if _G.ServerOccupiedGrids[userId] then
+		for _, key in ipairs(oldCells) do
+			if _G.ServerOccupiedGrids[userId][key] == oldBlock then
+				_G.ServerOccupiedGrids[userId][key] = nil
+			end
+		end
+	end
+
+	local _, rotY, _ = oldPivot:ToEulerAnglesYXZ()
+	local position = oldPivot.Position
+
+	-- 🗑️ Remove the old block (e.g. Oak Sapling)
+	oldBlock:Destroy()
+
+	-- 🌳 Clone and place the new block (e.g. Oak Tree)
+	local newBlock = template:Clone()
+	local fixedLocation = newBlock:FindFirstChild("FixedLocation")
+
+	if fixedLocation then
+		newBlock.Parent = workspace:WaitForChild("ActiveMap")
+		local fixedWorldOffset = newBlock:GetPivot().Position - fixedLocation.Position
+		newBlock:PivotTo(CFrame.new(position + fixedWorldOffset) * CFrame.Angles(0, rotY, 0))
+	else
+		newBlock.Parent = workspace:WaitForChild("ActiveMap")
+		local clonedBbox, _ = newBlock:GetBoundingBox()
+		local clonedPivot = newBlock:GetPivot()
+		local pivotToBboxOffset = clonedBbox.Position - clonedPivot.Position
+		newBlock:PivotTo(CFrame.new(position - pivotToBboxOffset) * CFrame.Angles(0, rotY, 0))
+	end
+
+	newBlock:SetAttribute("OwnerId", userId)
+
+	-- 📦 Register the new block's cells
+	local newCFrame, newSize = newBlock:GetBoundingBox()
+	local newCenter = Vector3.new(
+		math.round(newCFrame.Position.X / GRID_SIZE) * GRID_SIZE,
+		math.round(newCFrame.Position.Y / GRID_SIZE) * GRID_SIZE,
+		math.round(newCFrame.Position.Z / GRID_SIZE) * GRID_SIZE
+	)
+	local newCells = getModelOccupiedCells(newBlock, newCFrame.Position, newSize)
+
+	if not _G.ServerOccupiedGrids[userId] then _G.ServerOccupiedGrids[userId] = {} end
+	for _, key in ipairs(newCells) do
+		_G.ServerOccupiedGrids[userId][key] = newBlock
+	end
+
+	print("🌳 " .. (player and player.Name or "Owner") .. "'s block grew into: " .. growIntoName .. " (occupies " .. #newCells .. " cells)")
+end
+
+-- ========================================================
+-- GLOBAL UPGRADES & SITUATIONAL MULTIPLIERS
+-- ========================================================
+local GLOBAL_MINING_SPEED_MULTIPLIER = 1.0
+local activePotionThreads = {}
+
+local function getEquippedTool(player)
+	local character = player.Character
+	if character then
+		local tool = character:FindFirstChildOfClass("Tool")
+		if tool then return tool end
+	end
+	return nil
+end
+
+local function calculateHoldDuration(player, resourceModel)
+	local baseTime = resourceModel:GetAttribute("BaseMineTime") or 5.0
+	local equippedTool = getEquippedTool(player)
+
+	local toolPower = 1
+	if equippedTool then
+		toolPower = equippedTool:GetAttribute("MiningSpeed") or 1
+	end
+
+	local finalDuration = (baseTime / toolPower) * GLOBAL_MINING_SPEED_MULTIPLIER
+	return math.max(0.1, finalDuration)
+end
+
+-- COMBINED SINGLE EVENT CONNECTION
+MineResourceEvent.OnServerEvent:Connect(function(player, firstParam, secondParam)
+
+	-- ========================================================
+	-- SERVER INTERCEPT: DRINK HASTE POTION
+	-- ========================================================
+	if firstParam == "USE_POTION_ACTION" then
+		local slotName = secondParam
+		local playerSessions = InventorySessionManager.Sessions
+
+		local session = playerSessions[player.UserId]
+		if not session then return end
+
+		local itemRecord = session[slotName]
+		if not itemRecord then return end
+
+		local itemName = itemRecord.name
+		local itemAmount = itemRecord.amount or 1
+
+		local POTION_LIBRARY = {
+			["Haste Potion"]       = { multiplier = 0.5,  duration = 120 },
+			["Super Haste Potion"] = { multiplier = 0.33, duration = 60  },
+			["God Speed Potion"]   = { multiplier = 0.2,  duration = 30  },
+		}
+
+		local selectedPotionProfile = POTION_LIBRARY[itemName]
+
+		if selectedPotionProfile then
+			local speedBuff = selectedPotionProfile.multiplier
+			local timerClock = selectedPotionProfile.duration
+
+			if GLOBAL_MINING_SPEED_MULTIPLIER < 1.0 and speedBuff > GLOBAL_MINING_SPEED_MULTIPLIER then return end
+
+			if itemAmount > 1 then
+				local newAmount = itemAmount - 1
+				itemRecord.amount = newAmount
+				SaveInventoryEvent:FireClient(player, "Load", {[slotName] = {name = itemName, amount = newAmount}})
+			else
+				session[slotName] = nil
+				SaveInventoryEvent:FireClient(player, "Load", {[slotName] = "Clear"})
+
+				local character = player.Character
+				local currentTool = character and character:FindFirstChildOfClass("Tool")
+				if currentTool then currentTool:Destroy() end
+			end
+
+			GLOBAL_MINING_SPEED_MULTIPLIER = speedBuff
+			SaveInventoryEvent:FireClient(player, "UpdateHaste", speedBuff)
+
+			if activePotionThreads[player.UserId] then
+				task.cancel(activePotionThreads[player.UserId])
+			end
+
+			activePotionThreads[player.UserId] = task.delay(timerClock, function()
+				GLOBAL_MINING_SPEED_MULTIPLIER = 1.0
+				SaveInventoryEvent:FireClient(player, "UpdateHaste", 1.0)
+				activePotionThreads[player.UserId] = nil
+			end)
+		end
+		return
+	end
+
+	-- ========================================================
+	-- 1. INTERCEPT FOR HOTBAR EQUIPPING ACTION
+	-- ========================================================
+	if firstParam == "EQUIP_TOOL_ACTION" then
+		local character = player.Character
+		local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+
+		if humanoid and humanoid.Health > 0 then
+			local currentTool = character:FindFirstChildOfClass("Tool")
+			if currentTool then currentTool:Destroy() end
+
+			local toolName = secondParam
+			if toolName and toolName ~= "Clear" then
+				local ToolsStorage = game:GetService("ReplicatedStorage"):WaitForChild("ToolsStorage")
+				local toolTemplate = ToolsStorage:FindFirstChild(toolName)
+
+				if toolTemplate and toolTemplate:IsA("Tool") then
+					local newTool = toolTemplate:Clone()
+					newTool.Parent = character
+				end
+			end
+		end
+		return
+	end
+
+	-- ========================================================
+	-- 2. MINING CODE BLOCK (SERVER SIDE SYNCED WITH MOUSE)
+	-- ========================================================
+	local passedInstance = firstParam
+	if not passedInstance then return end
+
+	local resourceModel = nil
+	if passedInstance:IsA("Model") then
+		resourceModel = passedInstance
+	elseif passedInstance:IsA("BasePart") then
+		resourceModel = passedInstance:FindFirstAncestorOfClass("Model")
+	end
+
+	if not resourceModel then return end
+
+	local requiredToolsString = resourceModel:GetAttribute("RequiredTool")
+	local itemRewardID = resourceModel:GetAttribute("ItemRewardID") or resourceModel.Name
+
+	if requiredToolsString and requiredToolsString ~= "" then
+		local equippedTool = getEquippedTool(player)
+		local equippedToolName = equippedTool and equippedTool.Name or ""
+		local hasValidTool = false
+
+		local allowedTools = string.split(requiredToolsString, ",")
+		for _, toolName in ipairs(allowedTools) do
+			local cleanToolName = string.gsub(toolName, "^%s*(.-)%s*$", "%1")
+			if equippedToolName == cleanToolName then
+				hasValidTool = true
+				break
+			end
+		end
+
+		if not hasValidTool then return end
+	end
+
+	-- Mine Successful!
+	print("⛏️ " .. player.Name .. " successfully broke " .. resourceModel.Name)
+
+	-- ♾️ INFINITE BLOCK CHECK: Skip destruction and memory clearing if it's infinite!
+	local isInfinite = resourceModel:GetAttribute("IsInfinite") == true
+
+	if not isInfinite then
+		-- 🆕 If this was a world block, remember it was destroyed so it stays gone on rejoin
+		if resourceModel:GetAttribute("IsWorldBlock") then
+			local userId = tostring(player.UserId)
+			if not _G.DestroyedWorldBlocks[userId] then
+				_G.DestroyedWorldBlocks[userId] = {}
+			end
+			_G.DestroyedWorldBlocks[userId][resourceModel.Name] = true
+			print("💀 Marked world block as permanently destroyed: " .. resourceModel.Name)
+		end
+
+		-- DIRECT INSTANCE CELL CLEAR ENGINE
+		local userId = tostring(player.UserId)
+		if _G.ServerOccupiedGrids[userId] then
+			for key, allocatedInstance in pairs(_G.ServerOccupiedGrids[userId]) do
+				if allocatedInstance == resourceModel then
+					_G.ServerOccupiedGrids[userId][key] = nil
+				end
+			end
+		end
+
+		-- 🗺️ DESTROY FOR ACTIVE MAP
+		local activeMapFolder = workspace:FindFirstChild("ActiveMap")
+		if activeMapFolder and resourceModel:IsDescendantOf(activeMapFolder) then
+			resourceModel:Destroy()
+			print("🗑️ Block entirely removed from ActiveMap directory.")
+		end
+	else
+		print("♾️ Infinite block mined! Rewarding player but leaving block intact.")
+	end
+
+	-- 🎁 MULTI-ITEM REWARD ENGINE
+	local lootTableStr = resourceModel:GetAttribute("LootTable")
+	local rewardsToGive = {}
+
+	if lootTableStr then
+		-- Parse the text list (e.g., "12:3, 5:1") into a usable table
+		local parts = string.split(lootTableStr, ",")
+		for _, part in ipairs(parts) do
+			local idAndAmt = string.split(part, ":")
+			local itemId = tonumber(idAndAmt[1])
+			local amount = tonumber(idAndAmt[2]) or 1
+
+			if itemId then
+				table.insert(rewardsToGive, {id = itemId, amount = amount})
+			end
+		end
+	else
+		-- Fallback: If there is no LootTable, check for the old single-item attribute
+		local oldID = resourceModel:GetAttribute("ItemRewardID")
+		if oldID then
+			table.insert(rewardsToGive, {id = tonumber(oldID), amount = 1})
+		end
+	end
+
+	-- Hand out the rewards one by one!
+	local session = InventorySessionManager.Sessions[player.UserId]
+	if session and #rewardsToGive > 0 then
+		for _, reward in ipairs(rewardsToGive) do
+			-- Fire the client with the Number ID and Amount. 
+			-- The client already knows how to handle this and will tell the server what to save!
+			MineResourceEvent:FireClient(player, reward.id, reward.amount)
+			print("🎁 Queued reward: Item ID " .. reward.id .. " x" .. reward.amount)
+		end
+	end
+end)
+
+-- ========================================================
+-- PHYSICS LOOP: UPDATES PROMPT TIMERS BASED ON EQUIPPED TOOL
+-- ========================================================
+task.spawn(function()
+	while task.wait(0.5) do
+		for _, player in ipairs(game.Players:GetPlayers()) do
+			local character = player.Character
+			local primaryPart = character and character.PrimaryPart
+
+			if primaryPart then
+				for _, instance in ipairs(workspace:GetDescendants()) do
+					if instance:IsA("ProximityPrompt") and instance.Parent then
+						local resource = instance.Parent
+						if resource:GetAttribute("ItemRewardID") then
+							local distance = (primaryPart.Position - instance.Parent:GetPivot().Position).Magnitude
+							if distance <= instance.MaxActivationDistance + 5 then
+								instance.HoldDuration = calculateHoldDuration(player, resource)
+							end
+						end
+					end
+				end
+			end
+		end
+	end
+end)
+
+-- ========================================================
+-- PLACEMENT HANDLER BLOCK (DEBUG VERSION)
+-- ========================================================
+local ItemTemplates = ReplicatedStorage:WaitForChild("ItemTemplates")
+local PlaceBlockEvent = ReplicatedStorage:WaitForChild("PlaceBlockEvent")
+
+PlaceBlockEvent.OnServerEvent:Connect(function(player, blockName, clientSentCFrame)
+	local character = player.Character
+	if not character then return end
+
+	local userId = tostring(player.UserId)
+	if not _G.ServerOccupiedGrids[userId] then _G.ServerOccupiedGrids[userId] = {} end
+
+	local session = InventorySessionManager.Sessions[player.UserId]
+	if not session then return end
+
+	local targetSlot, itemRecord = nil, nil
+	for slotName, data in pairs(session) do
+		if data and data.name == blockName and data.amount > 0 then
+			targetSlot, itemRecord = slotName, data
+			break
+		end
+	end
+
+	if not itemRecord then return end
+
+	local template = ItemTemplates:FindFirstChild(blockName)
+	if template then
+		local _, blockBoxSize = template:GetBoundingBox()
+		local rawPos = clientSentCFrame.Position
+		local snappedPos = Vector3.new(
+			math.round(rawPos.X / GRID_SIZE) * GRID_SIZE,
+			math.round(rawPos.Y / GRID_SIZE) * GRID_SIZE,
+			math.round(rawPos.Z / GRID_SIZE) * GRID_SIZE
+		)
+
+		local fixedLocation = template:FindFirstChild("FixedLocation")
+
+		local rotationCFrame = CFrame.new(snappedPos) * CFrame.Angles(0, clientSentCFrame:ToEulerAnglesYXZ(), 0)
+		local realBlock = template:Clone()
+		if fixedLocation then
+			local clonedFixed = realBlock:FindFirstChild("FixedLocation")
+			realBlock.Parent = workspace:WaitForChild("ActiveMap")
+			local fixedWorldOffset = realBlock:GetPivot().Position - clonedFixed.Position
+			realBlock:PivotTo(CFrame.new(snappedPos + fixedWorldOffset) * CFrame.Angles(0, select(2, clientSentCFrame:ToEulerAnglesYXZ()), 0))
+		else
+			local modelCFrame, _ = realBlock:GetBoundingBox()
+			local pivotOffset = realBlock:GetPivot():ToObjectSpace(modelCFrame)
+			realBlock:PivotTo(CFrame.new(snappedPos) * CFrame.Angles(0, select(2, clientSentCFrame:ToEulerAnglesYXZ()), 0) * pivotOffset:Inverse())
+			realBlock.Parent = workspace:WaitForChild("ActiveMap")
+		end
+
+		local placedCFrame, placedSize = realBlock:GetBoundingBox()
+		local targetCells = getModelOccupiedCells(realBlock, placedCFrame.Position, placedSize)
+		local placedCenter = Vector3.new(
+			math.round(placedCFrame.Position.X / GRID_SIZE) * GRID_SIZE,
+			math.round(placedCFrame.Position.Y / GRID_SIZE) * GRID_SIZE,
+			math.round(placedCFrame.Position.Z / GRID_SIZE) * GRID_SIZE
+		)
+
+		-- ===== DEBUG: CHECK TRANSPARENTBOUNDARY DETECTION =====
+		local boundaryCount = 0
+		for _, part in ipairs(realBlock:GetDescendants()) do
+			if part:IsA("BasePart") and part.Name:match("^TransparentBoundary") then
+				boundaryCount = boundaryCount + 1
+				print("🔲 Found TransparentBoundary part: " .. part.Name .. " at position " .. tostring(part.Position))
+			end
+		end
+
+		if boundaryCount > 0 then
+			print("✅ DEBUG: Using TransparentBoundary system. Found " .. boundaryCount .. " boundary parts on " .. blockName)
+		else
+			print("⚠️ DEBUG: No TransparentBoundary parts found on " .. blockName .. ". Falling back to bounding box method.")
+			print("   Bounding box size: " .. tostring(placedSize))
+			print("   Bounding box center: " .. tostring(placedCenter))
+		end
+		-- ===== END DEBUG =====
+
+		local targetCells = getModelOccupiedCells(realBlock, placedCFrame.Position, placedSize)
+
+		-- ===== DEBUG: HOW MANY CELLS DOES THIS BLOCK OCCUPY? =====
+		print("📦 DEBUG: " .. blockName .. " occupies " .. #targetCells .. " grid cells:")
+		for _, key in ipairs(targetCells) do
+			print("   → Cell: " .. key)
+		end
+		-- ===== END DEBUG =====
+
+		for _, key in ipairs(targetCells) do
+			local existingBlock = _G.ServerOccupiedGrids[userId][key]
+			if existingBlock and typeof(existingBlock) == "Instance" and existingBlock.Parent then
+				print("♻️ Server Overwrite: Found existing block '" .. existingBlock.Name .. "'. Cleaning space...")
+				for k, allocatedInstance in pairs(_G.ServerOccupiedGrids[userId]) do
+					if allocatedInstance == existingBlock then
+						_G.ServerOccupiedGrids[userId][k] = nil
+					end
+				end
+				existingBlock:Destroy()
+			end
+		end
+
+		realBlock:SetAttribute("OwnerId", userId)
+
+		for _, key in ipairs(targetCells) do
+			_G.ServerOccupiedGrids[userId][key] = realBlock
+		end
+
+		-- 🌱 GROWTH CHECK: If this block grows into something else, start the timer
+		local growsInto = realBlock:GetAttribute("GrowsInto")
+		local growTime = realBlock:GetAttribute("GrowTime")
+
+		if growsInto and growTime then
+			realBlock:SetAttribute("PlantedAt", os.time()) -- 🆕 Record when this was planted
+			print("🌱 " .. blockName .. " planted! Will grow into " .. tostring(growsInto) .. " in " .. growTime .. " seconds.")
+			task.delay(growTime, growBlock, player, userId, realBlock, growsInto)
+		end
+
+		if itemRecord.amount > 1 then
+			itemRecord.amount = itemRecord.amount - 1
+			SaveInventoryEvent:FireClient(player, "Load", {[targetSlot] = {name = blockName, amount = itemRecord.amount}})
+		else
+			session[targetSlot] = {name = "", amount = 0}
+			SaveInventoryEvent:FireClient(player, "Load", {[targetSlot] = "Clear"})
+		end
+	end
+end)
