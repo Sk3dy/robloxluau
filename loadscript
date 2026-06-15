@@ -1,3 +1,5 @@
+-- (LocalScript in StarterGui - screengui - loadworldbutton)
+
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Players = game:GetService("Players")
 local RequestWorldLoadEvent = ReplicatedStorage:WaitForChild("RequestWorldLoadEvent")
