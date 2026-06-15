@@ -1,0 +1,58 @@
+local DataStoreService = game:GetService("DataStoreService")
+local InventoryStore = DataStoreService:GetDataStore("PlayerInventory_v4") 
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local SaveInventoryEvent = ReplicatedStorage:WaitForChild("SaveInventory")
+local MineResourceEvent = ReplicatedStorage:WaitForChild("MineResourceEvent") -- 🆕 Used to grant starter items
+
+-- Link up with our shared backend data table module
+local InventorySessionManager = require(ReplicatedStorage:WaitForChild("InventorySessionManager"))
+local playerSessions = InventorySessionManager.Sessions
+
+game.Players.PlayerAdded:Connect(function(player)
+	local userId = player.UserId
+	local success, savedData = pcall(function()
+		return InventoryStore:GetAsync(tostring(userId))
+	end)
+
+	if success and savedData then
+		playerSessions[userId] = savedData
+		task.wait(2.5) -- Give Client UI time to initialize
+		SaveInventoryEvent:FireClient(player, "Load", savedData)
+		print("player didnt join for the first time")
+	else
+		playerSessions[userId] = {}
+
+		-- 🆕 FIRST TIME JOIN: Give the player a starting Pickaxe (Item ID 4)
+		task.wait(2.5) -- Give Client UI time to initialize, same as the returning-player branch
+		print("🎉 First time join detected for " .. player.Name .. "! Granting starter Pickaxe.")
+		MineResourceEvent:FireClient(player, 4, 1)
+	end
+end)
+
+game.Players.PlayerRemoving:Connect(function(player)
+	local userId = player.UserId
+	if playerSessions[userId] then
+		pcall(function()
+			InventoryStore:SetAsync(tostring(userId), playerSessions[userId])
+		end)
+		playerSessions[userId] = nil
+	end
+end)
+
+SaveInventoryEvent.OnServerEvent:Connect(function(player, action, slotName, itemName, amount)
+	local userId = player.UserId
+	if not playerSessions[userId] then playerSessions[userId] = {} end
+
+	if action == "UpdateSlot" then
+		if itemName == nil or itemName == "" then
+			playerSessions[userId][slotName] = nil
+			print("Server Save: Cleared slot " .. slotName)
+		else
+			playerSessions[userId][slotName] = {
+				name = itemName,
+				amount = amount or 1
+			}
+			print("Server Secure Save: " .. slotName .. " now holds " .. itemName .. " x" .. tostring(amount))
+		end
+	end
+end)
