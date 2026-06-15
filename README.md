@@ -1,0 +1,12 @@
+uicreation - localscript
+commands - localscript
+inventorydatasystem - serverscript
+miningsystemmanager - serverscript
+custompromptmanager - localscript
+inventorysessionmanager - modulescript
+worldsave - serverscript
+loadscript - localscript
+biomedisplay - localscript
+biomeservice - serverscript
+oceangenerator - serverscript
+occupiedcellsmodule - modulescript
