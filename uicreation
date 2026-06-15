@@ -1,0 +1,125 @@
+local player = game.Players.LocalPlayer
+local playergui = player:WaitForChild("PlayerGui")
+local screengui = playergui:WaitForChild("ScreenGui")
+local inventoryAnchor = screengui:FindFirstChild("InventoryAnchor", true)
+if inventoryAnchor then
+	inventoryAnchor.AnchorPoint = Vector2.new(0.5, 1)
+	inventoryAnchor.Position = UDim2.new(0.5, 0, 1, -60)
+	inventoryAnchor.BackgroundTransparency = 1
+end
+local loadWorldButton = screengui:FindFirstChild("LoadWorldButton", true)
+if loadWorldButton then
+	loadWorldButton.AnchorPoint = Vector2.new(0, 1)
+	loadWorldButton.Position = UDim2.new(0, 100, 1, -50)
+end
+local inventoryui = screengui:FindFirstChild("inventoryui", true)
+
+
+
+
+
+-- 3. HOTBAR GRID CREATION (1 row x 9 columns, hotbar1 to hotbar9)
+local cellConstraint2 = inventoryui:FindFirstChild("CellConstraint2", true)
+if cellConstraint2 then
+	local hotbarGrid = cellConstraint2:FindFirstChildOfClass("UIGridLayout")
+	if not hotbarGrid then
+		hotbarGrid = Instance.new("UIGridLayout")
+		hotbarGrid.Name = "UIGridLayoutHotbar"
+		hotbarGrid.HorizontalAlignment = Enum.HorizontalAlignment.Center
+		hotbarGrid.VerticalAlignment = Enum.VerticalAlignment.Center
+		hotbarGrid.CellSize = UDim2.new(1/9.8, 0, 1/1, 0)
+		hotbarGrid.CellPadding = UDim2.new(0.01, 0.003, 0.01, 0.003)
+		hotbarGrid.Parent = cellConstraint2
+	end
+	local aspectRatio = hotbarGrid:FindFirstChildOfClass("UIAspectRatioConstraint")
+	if not aspectRatio then
+		aspectRatio = Instance.new("UIAspectRatioConstraint")
+		aspectRatio.AspectRatio = 1
+		aspectRatio.AspectType = Enum.AspectType.FitWithinMaxSize
+		aspectRatio.DominantAxis = Enum.DominantAxis.Height
+		aspectRatio.Parent = hotbarGrid
+	end
+	for i = 1, 9 do
+		if not cellConstraint2:FindFirstChild("hotbar" .. i) then
+			local slot = Instance.new("Frame")
+			slot.Name = "hotbar" .. i
+			slot.Active = true
+			slot.BackgroundTransparency = 1
+			slot.ZIndex = 2
+			slot.Parent = cellConstraint2
+		end
+	end
+end
+
+
+
+-- 4. BACKPACK GRID CREATION (7 rows x 9 columns = 63 slots, hotbar10 to hotbar72)
+local backpackui = inventoryui:FindFirstChild("backpackui", true) or 
+	(screengui:FindFirstChild("InventoryAnchor", true) and 
+		screengui:FindFirstChild("InventoryAnchor", true):FindFirstChild("backpackui", true))
+
+if backpackui then
+	local cellConstraint = backpackui:FindFirstChild("CellConstraint", true)
+	if not cellConstraint then
+		warn("CellConstraint frame not found inside backpackui")
+		return
+	end
+
+	local backpackGrid = cellConstraint:FindFirstChildOfClass("UIGridLayout")
+	if not backpackGrid then
+		backpackGrid = Instance.new("UIGridLayout")
+		backpackGrid.Name = "UIGridLayoutBackpack"
+		backpackGrid.HorizontalAlignment = Enum.HorizontalAlignment.Center
+		backpackGrid.VerticalAlignment = Enum.VerticalAlignment.Center
+		backpackGrid.CellSize = UDim2.new(1/9.8, 0, 1/7, 0)
+		backpackGrid.CellPadding = UDim2.new(0.01, 0.003, 0.01, 0.003)
+		backpackGrid.Parent = cellConstraint
+	end
+
+	local aspectRatio = backpackGrid:FindFirstChildOfClass("UIAspectRatioConstraint")
+	if not aspectRatio then
+		aspectRatio = Instance.new("UIAspectRatioConstraint")
+		aspectRatio.AspectRatio = 1
+		aspectRatio.AspectType = Enum.AspectType.FitWithinMaxSize
+		aspectRatio.DominantAxis = Enum.DominantAxis.Height
+		aspectRatio.Parent = backpackGrid
+	end
+
+	for i = 10, 72 do
+		if not cellConstraint:FindFirstChild("hotbar" .. i) then
+			local slot = Instance.new("Frame")
+			slot.Name = "hotbar" .. i
+			slot.Active = true
+			slot.BackgroundTransparency = 1
+			slot.ZIndex = 2
+			slot.Parent = cellConstraint
+		end
+	end
+end
+
+-- 5. BACKPACK TOGGLE BUTTON
+local UserInputService = game:GetService("UserInputService")
+local TweenService = game:GetService("TweenService")
+
+local backpackVisible = true
+local toggleButton = backpackui and backpackui:FindFirstChildOfClass("ImageButton", true)
+
+local function setBackpackVisible(visible)
+	backpackVisible = visible
+	local targetPosition = visible and UDim2.new(0, 0, 0, 0) or UDim2.new(0, 0, -4, 0)
+	TweenService:Create(backpackui, TweenInfo.new(0, Enum.EasingStyle.Quad), {Position = targetPosition}):Play()
+end
+
+if toggleButton then
+	toggleButton.MouseButton1Click:Connect(function()
+		setBackpackVisible(not backpackVisible)
+	end)
+end
+
+UserInputService.InputBegan:Connect(function(input, gameProcessed)
+	if gameProcessed then return end
+	if input.KeyCode == Enum.KeyCode.E then
+		setBackpackVisible(not backpackVisible)
+	end
+end)
+
