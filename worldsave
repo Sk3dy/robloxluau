@@ -1,0 +1,368 @@
+local DataStoreService = game:GetService("DataStoreService")
+local VoxelWorldDataStore = DataStoreService:GetDataStore("PlayerVoxelWorlds_v1")
+local DestroyedBlocksStore = DataStoreService:GetDataStore("PlayerDestroyedBlocks_v1") -- 🆕 Remembers broken world blocks
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local Players = game:GetService("Players")
+
+local RequestWorldLoadEvent = ReplicatedStorage:WaitForChild("RequestWorldLoadEvent")
+local WorldLoadCompleteEvent = ReplicatedStorage:WaitForChild("WorldLoadCompleteEvent")
+local ItemTemplates = ReplicatedStorage:WaitForChild("ItemTemplates")
+local ActiveMap = workspace:WaitForChild("ActiveMap")
+
+local GRID_SIZE = 4
+-- 🆕 Converts any world coordinate into its grid cell index (an integer)
+local function worldToCellIndex(value)
+	return math.floor(value / GRID_SIZE)
+end
+_G.ServerOccupiedGrids = _G.ServerOccupiedGrids or {}
+_G.DestroyedWorldBlocks = _G.DestroyedWorldBlocks or {} -- 🆕 Tracks which world blocks got broken this session
+
+-- 🔒 THE SERVER LOCK VARIABLES
+local isWorldLoadedInServer = false
+local currentWorldOwnerUserId = nil
+
+local function getServerOccupiedCells(centerPos: Vector3, modelSize: Vector3)
+	local cells = {}
+	local stepsX = math.max(1, math.round(modelSize.X / GRID_SIZE))
+	local stepsY = math.max(1, math.round(modelSize.Y / GRID_SIZE))
+	local stepsZ = math.max(1, math.round(modelSize.Z / GRID_SIZE))
+
+	-- Find the minimum corner of the bounding box
+	local minX = centerPos.X - (modelSize.X / 2)
+	local minY = centerPos.Y - (modelSize.Y / 2)
+	local minZ = centerPos.Z - (modelSize.Z / 2)
+
+	for x = 0, stepsX - 1 do
+		for y = 0, stepsY - 1 do
+			for z = 0, stepsZ - 1 do
+				-- 🆕 Round EACH cell independently to the same lattice as TransparentBoundary (multiples of GRID_SIZE)
+				local cellCenterX = math.round((minX + (x + 0.5) * GRID_SIZE) / GRID_SIZE) * GRID_SIZE
+				local cellCenterY = math.round((minY + (y + 0.5) * GRID_SIZE) / GRID_SIZE) * GRID_SIZE
+				local cellCenterZ = math.round((minZ + (z + 0.5) * GRID_SIZE) / GRID_SIZE) * GRID_SIZE
+				local key = string.format("%d,%d,%d", cellCenterX, cellCenterY, cellCenterZ)
+				table.insert(cells, key)
+			end
+		end
+	end
+	return cells
+end
+
+local function getModelOccupiedCells(model, centerPos, size)
+	local boundaries = {}
+	for _, part in ipairs(model:GetDescendants()) do
+		if part:IsA("BasePart") and part.Name:match("^TransparentBoundary") then
+			table.insert(boundaries, part)
+		end
+	end
+
+	if #boundaries > 0 then
+		local cells = {}
+		for _, part in ipairs(boundaries) do
+			local pos = part.Position
+			-- 🔧 Snap to world-coordinate grid lines (NOT divided indices)
+			-- so this matches the key format used by getServerOccupiedCells
+			local snappedX = math.round(pos.X / GRID_SIZE) * GRID_SIZE
+			local snappedY = math.round(pos.Y / GRID_SIZE) * GRID_SIZE
+			local snappedZ = math.round(pos.Z / GRID_SIZE) * GRID_SIZE
+
+			table.insert(cells, string.format("%d,%d,%d", snappedX, snappedY, snappedZ))
+		end
+		return cells
+	end
+
+	-- Fallback: no TransparentBoundary parts found, use existing bounding-box method
+	return getServerOccupiedCells(centerPos, size)
+end
+
+local function growBlock(player, userId, oldBlock, growIntoName)
+	-- Safety check: if the block was mined/destroyed before it could grow, do nothing
+	if not oldBlock or not oldBlock.Parent then
+		print("🌱 Growth cancelled: block no longer exists.")
+		return
+	end
+
+	local template = ItemTemplates:FindFirstChild(growIntoName)
+	if not template then
+		warn("⚠️ Cannot grow - no template found for " .. growIntoName)
+		return
+	end
+
+	-- Get the old block's position and rotation before removing it
+	local oldPivot = oldBlock:GetPivot()
+	local oldCFrame, oldSize = oldBlock:GetBoundingBox()
+	local oldCenter = Vector3.new(
+		math.round(oldCFrame.Position.X / GRID_SIZE) * GRID_SIZE,
+		math.round(oldCFrame.Position.Y / GRID_SIZE) * GRID_SIZE,
+		math.round(oldCFrame.Position.Z / GRID_SIZE) * GRID_SIZE
+	)
+	local oldCells = getModelOccupiedCells(oldBlock, oldCFrame.Position, oldSize)
+
+	-- 🧹 Free up the old block's cells
+	if _G.ServerOccupiedGrids[userId] then
+		for _, key in ipairs(oldCells) do
+			if _G.ServerOccupiedGrids[userId][key] == oldBlock then
+				_G.ServerOccupiedGrids[userId][key] = nil
+			end
+		end
+	end
+
+	local _, rotY, _ = oldPivot:ToEulerAnglesYXZ()
+	local position = oldPivot.Position
+
+	-- 🗑️ Remove the old block (e.g. Oak Sapling)
+	oldBlock:Destroy()
+
+	-- 🌳 Clone and place the new block (e.g. Oak Tree)
+	local newBlock = template:Clone()
+	local fixedLocation = newBlock:FindFirstChild("FixedLocation")
+
+	if fixedLocation then
+		newBlock.Parent = workspace:WaitForChild("ActiveMap")
+		local fixedWorldOffset = newBlock:GetPivot().Position - fixedLocation.Position
+		newBlock:PivotTo(CFrame.new(position + fixedWorldOffset) * CFrame.Angles(0, rotY, 0))
+	else
+		newBlock.Parent = workspace:WaitForChild("ActiveMap")
+		local clonedBbox, _ = newBlock:GetBoundingBox()
+		local clonedPivot = newBlock:GetPivot()
+		local pivotToBboxOffset = clonedBbox.Position - clonedPivot.Position
+		newBlock:PivotTo(CFrame.new(position - pivotToBboxOffset) * CFrame.Angles(0, rotY, 0))
+	end
+
+	newBlock:SetAttribute("OwnerId", userId)
+
+	-- 📦 Register the new block's cells
+	local newCFrame, newSize = newBlock:GetBoundingBox()
+	local newCenter = Vector3.new(
+		math.round(newCFrame.Position.X / GRID_SIZE) * GRID_SIZE,
+		math.round(newCFrame.Position.Y / GRID_SIZE) * GRID_SIZE,
+		math.round(newCFrame.Position.Z / GRID_SIZE) * GRID_SIZE
+	)
+	local newCells = getModelOccupiedCells(newBlock, newCFrame.Position, newSize)
+
+	if not _G.ServerOccupiedGrids[userId] then _G.ServerOccupiedGrids[userId] = {} end
+	for _, key in ipairs(newCells) do
+		_G.ServerOccupiedGrids[userId][key] = newBlock
+	end
+
+	print("🌳 " .. (player and player.Name or "Owner") .. "'s block grew into: " .. growIntoName .. " (occupies " .. #newCells .. " cells)")
+end
+
+-- 📥 INITIALIZE MEMORY LAYOUT ON JOIN
+Players.PlayerAdded:Connect(function(player)
+	local userId = tostring(player.UserId)
+	_G.ServerOccupiedGrids[userId] = {}
+
+	if isWorldLoadedInServer then
+		RequestWorldLoadEvent:FireClient(player, "LockButton")
+	end
+end)
+
+RequestWorldLoadEvent.OnServerEvent:Connect(function(player)
+	if isWorldLoadedInServer then
+		print("❌ Load Rejected: A world is already active in this server!")
+		return
+	end
+
+	local userId = tostring(player.UserId)
+	local dataStoreKey = "VoxelWorld_" .. userId
+
+	isWorldLoadedInServer = true
+	currentWorldOwnerUserId = userId
+
+	RequestWorldLoadEvent:FireAllClients("LockButton")
+
+	-- 🆕 Load the list of world blocks this player already broke before
+	local destroyedSuccess, destroyedData = pcall(function()
+		return DestroyedBlocksStore:GetAsync("Destroyed_" .. userId)
+	end)
+	local destroyedSet = {}
+	if destroyedSuccess and destroyedData then
+		for _, blockId in ipairs(destroyedData) do
+			destroyedSet[blockId] = true -- Put them in a lookup table for fast checking
+		end
+		print("💀 Loaded " .. #destroyedData .. " previously destroyed world blocks for " .. player.Name)
+	end
+
+	-- 🆕 Remove any pre-placed world blocks that this player already broke
+	for _, block in ipairs(ActiveMap:GetDescendants()) do
+		if block:IsA("Model") and block:GetAttribute("IsWorldBlock") then
+			if destroyedSet[block.Name] then
+				print("🚫 Removing already-broken world block: " .. block.Name)
+				block:Destroy()
+			end
+		end
+	end
+
+	-- Store the destroyed set in memory so miningsystemmanager can add to it
+	_G.DestroyedWorldBlocks[userId] = destroyedSet
+
+	-- Load the player's saved placed blocks (their construction)
+	local success, savedWorldData = pcall(function()
+		return VoxelWorldDataStore:GetAsync(dataStoreKey)
+	end)
+
+	if success and savedWorldData then
+		print("💾 Manually loading world data for " .. player.Name)
+		for gridKey, blockData in pairs(savedWorldData) do
+			local blockName, blockRotY, savedPlantedAt
+			if type(blockData) == "table" then
+				blockName = blockData.name
+				blockRotY = blockData.rotY or 0
+				savedPlantedAt = blockData.plantedAt -- 🆕 nil for normal blocks
+			elseif type(blockData) == "string" and string.find(blockData, "|") then
+				local parts = string.split(blockData, "|")
+				blockName = parts[1]
+				blockRotY = tonumber(parts[2]) or 0
+			else
+				blockName = blockData
+				blockRotY = 0
+			end
+			print("Loading:", blockName, "rotY:", blockRotY)
+			local template = ItemTemplates:FindFirstChild(blockName)
+			if template then
+				local cx, cy, cz = string.match(gridKey, "(-?%d+),(-?%d+),(-?%d+)")
+				local position = Vector3.new(tonumber(cx), tonumber(cy), tonumber(cz))
+				print("LOADING block: " .. blockName .. " | at position: " .. tostring(position))
+				local realBlock = template:Clone()
+				local fixedLocation = realBlock:FindFirstChild("FixedLocation")
+
+				if fixedLocation then
+					realBlock.Parent = ActiveMap
+					local fixedWorldOffset = realBlock:GetPivot().Position - fixedLocation.Position
+					realBlock:PivotTo(CFrame.new(position + fixedWorldOffset) * CFrame.Angles(0, math.rad(blockRotY), 0))
+				else
+					realBlock.Parent = ActiveMap
+					local clonedBbox, _ = realBlock:GetBoundingBox()
+					local clonedPivot = realBlock:GetPivot()
+					local pivotToBboxOffset = clonedBbox.Position - clonedPivot.Position
+					realBlock:PivotTo(CFrame.new(position - pivotToBboxOffset) * CFrame.Angles(0, math.rad(blockRotY), 0))
+				end
+
+				realBlock:SetAttribute("OwnerId", userId)
+
+				local placedCFrame, placedSize = realBlock:GetBoundingBox()
+				local placedCenter = Vector3.new(
+					math.round(placedCFrame.Position.X / GRID_SIZE) * GRID_SIZE,
+					math.round(placedCFrame.Position.Y / GRID_SIZE) * GRID_SIZE,
+					math.round(placedCFrame.Position.Z / GRID_SIZE) * GRID_SIZE
+				)
+				local targetCells = getModelOccupiedCells(realBlock, placedCFrame.Position, placedSize)
+				for _, cellKey in ipairs(targetCells) do
+					_G.ServerOccupiedGrids[userId][cellKey] = realBlock
+				end
+
+				-- 🌱 GROWTH RESUME: If saved while still growing, resume or finish the timer
+				local growsInto = realBlock:GetAttribute("GrowsInto")
+				local growTime = realBlock:GetAttribute("GrowTime")
+
+				if growsInto and growTime and savedPlantedAt then
+					realBlock:SetAttribute("PlantedAt", savedPlantedAt)
+					local elapsed = os.time() - savedPlantedAt
+
+					if elapsed >= growTime then
+						print("🌳 " .. blockName .. " finished growing while you were away! Growing now...")
+						growBlock(nil, userId, realBlock, growsInto)
+					else
+						local remaining = growTime - elapsed
+						print("🌱 " .. blockName .. " resuming growth. " .. math.floor(remaining) .. "s remaining.")
+						task.delay(remaining, growBlock, nil, userId, realBlock, growsInto)
+					end
+				end
+
+
+			end
+		end
+	else
+		print("🌱 No world found for " .. player.Name .. ". Server locked to a brand new build!")
+	end
+	-- 🆕 Tell the client that the server has finished loading all blocks!
+	WorldLoadCompleteEvent:FireClient(player)
+end)
+
+-- 📤 SAVE ON LEAVE (ONLY SAVES THE OWNER)
+local alreadySaved = {}
+local function savePlayerData(player)
+	local userId = tostring(player.UserId)
+
+	if userId ~= currentWorldOwnerUserId then return end
+	if alreadySaved[userId] then return end
+	alreadySaved[userId] = true
+
+	-- Save placed blocks (your construction)
+	local dataStoreKey = "VoxelWorld_" .. userId
+	if not _G.ServerOccupiedGrids[userId] then return end
+
+	local dataToSave = {}
+	local processedBlocks = {}
+
+	for gridKey, blockInstance in pairs(_G.ServerOccupiedGrids[userId]) do
+		if blockInstance and blockInstance.Parent and not processedBlocks[blockInstance] then
+			processedBlocks[blockInstance] = true
+
+			local bboxCFrame, _ = blockInstance:GetBoundingBox()
+			local fixedLocation = blockInstance:FindFirstChild("FixedLocation")
+
+			local savePos
+			if fixedLocation then
+				savePos = Vector3.new(
+					math.round(fixedLocation.Position.X / GRID_SIZE) * GRID_SIZE,
+					math.round(fixedLocation.Position.Y / GRID_SIZE) * GRID_SIZE,
+					math.round(fixedLocation.Position.Z / GRID_SIZE) * GRID_SIZE
+				)
+			else
+				local bboxPos = bboxCFrame.Position
+				savePos = Vector3.new(
+					math.round(bboxPos.X / GRID_SIZE) * GRID_SIZE,
+					math.round(bboxPos.Y / GRID_SIZE) * GRID_SIZE,
+					math.round(bboxPos.Z / GRID_SIZE) * GRID_SIZE
+				)
+			end
+
+			local originKey = string.format("%d,%d,%d", savePos.X, savePos.Y, savePos.Z)
+			local _, rotY, _ = blockInstance:GetPivot():ToEulerAnglesYXZ()
+			local rotYDeg = math.round(math.deg(rotY))
+			print("Saving:", blockInstance.Name, "rotY:", rotYDeg)
+
+			-- 🌱 If this block is still growing, save it as a table with PlantedAt
+			local plantedAt = blockInstance:GetAttribute("PlantedAt")
+			local growsInto = blockInstance:GetAttribute("GrowsInto")
+
+			if growsInto and plantedAt then
+				dataToSave[originKey] = {
+					name = blockInstance.Name,
+					rotY = rotYDeg,
+					plantedAt = plantedAt
+				}
+				print("🌱 Saved as growable block. PlantedAt: " .. tostring(plantedAt))
+			else
+				dataToSave[originKey] = blockInstance.Name .. "|" .. tostring(rotYDeg)
+			end
+		end
+	end
+
+	pcall(function()
+		VoxelWorldDataStore:SetAsync(dataStoreKey, dataToSave)
+	end)
+
+	-- 🆕 Save the list of destroyed world blocks
+	if _G.DestroyedWorldBlocks[userId] then
+		local destroyedList = {}
+		for blockId, _ in pairs(_G.DestroyedWorldBlocks[userId]) do
+			table.insert(destroyedList, blockId)
+		end
+		pcall(function()
+			DestroyedBlocksStore:SetAsync("Destroyed_" .. userId, destroyedList)
+		end)
+		print("💀 Saved " .. #destroyedList .. " destroyed world blocks for " .. player.Name)
+	end
+
+	print("✅ Active world saved and server released.")
+end
+
+Players.PlayerRemoving:Connect(savePlayerData)
+
+game:BindToClose(function()
+	for _, player in ipairs(Players:GetPlayers()) do
+		task.spawn(savePlayerData, player)
+	end
+end)
